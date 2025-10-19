@@ -30,6 +30,7 @@ pub async fn info_handler(State(state): State<Arc<AppState>>) -> Json<InfoRespon
                 shoulder: shoulder.clone(),
                 project_name: config.project_name.clone(),
                 uses_check_character: config.uses_check_character,
+                blade_length,
                 example_ark: mint_ark(
                     &state.naan,
                     shoulder,

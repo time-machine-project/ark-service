@@ -50,6 +50,7 @@ pub struct ShoulderInfo {
     pub shoulder: String,
     pub project_name: String,
     pub uses_check_character: bool,
+    pub blade_length: usize,
     pub example_ark: String,
 }
 

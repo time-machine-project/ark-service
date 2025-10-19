@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     image: ghcr.io/${GITHUB_REPOSITORY:-yourorg/ark-service}:latest
     container_name: ark-service
-    restart: unless-stopped
+    restart: "no"
     ports:
       - "3000:3000"
     environment:
@@ -26,11 +26,9 @@ services:
       test:
         [
           "CMD",
-          "wget",
-          "--quiet",
-          "--tries=1",
-          "--spider",
-          "http://localhost:3000/ark:${NAAN:-12345}/servicestatus",
+          "curl",
+          "-f",
+          "http://localhost:3000/ark:$${NAAN:-12345}/servicestatus",
         ]
       interval: 30s
       timeout: 3s

@@ -32,7 +32,7 @@ WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y ca-certificates && \
+    apt-get install -y ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
@@ -52,10 +52,6 @@ ENV NAAN="12345" \
     DEFAULT_BLADE_LENGTH="8" \
     MAX_MINT_COUNT="1000" \
     RUST_LOG="info"
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/ark-service", "--version"] || exit 1
 
 # Run the application
 CMD ["/usr/local/bin/ark-service"]

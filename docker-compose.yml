@@ -1,0 +1,38 @@
+services:
+  ark-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/${GITHUB_REPOSITORY:-yourorg/ark-service}:latest
+    container_name: ark-service
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NAAN: ${NAAN:-12345}
+      DEFAULT_BLADE_LENGTH: ${DEFAULT_BLADE_LENGTH:-8}
+      MAX_MINT_COUNT: ${MAX_MINT_COUNT:-1000}
+      RUST_LOG: ${RUST_LOG:-info}
+      SHOULDERS: ${SHOULDERS:-{"x6":{"route_pattern":"https://example.org/$${value}","project_name":"Example Project","uses_check_character":true}}}
+
+    logging:
+      driver: "local"
+      options:
+        max-size: "100m"
+        max-file: "10"
+        compress: "true"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3000/ark:${NAAN:-12345}/servicestatus",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

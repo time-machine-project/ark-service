@@ -1,55 +1,41 @@
 # ARK Service
 
-**A lightweight, high-performance service for minting, validating, and resolving ARK (Archival Resource Key) identifiers.**
+**A lightweight, stateless service for minting and validating ARK (Archival Resource Key) identifiers.**
 
-ARK Service is a Rust-based web service that implements the ARK identifier specification (IETF draft-kunze-ark-34). It provides a RESTful API for creating persistent, globally unique identifiers with built-in error detection through the Noid Check Digit Algorithm. The service supports multiple "shoulders" (identifier namespaces) with customizable routing patterns, making it ideal for institutions that need to manage digital object identifiers across different projects or collections.
+ARK Service is a Rust-based web service that generates random ARK identifiers with optional NCDA check characters. Unlike traditional ARK minters (Noid, EZID), it's designed for stateless operation with no database required, making it fast and horizontally scalable. The service supports multiple "shoulders" (identifier namespaces) with customizable URL resolution patterns.
 
 **Key Features:**
 
 - Fast and memory-efficient (built with Rust and Axum)
+- Stateless operation (no database required)
 - Multiple namespace support via shoulders
 - NCDA (Noid Check Digit Algorithm) for error detection
 - Flexible URL resolution with template variables
 - RESTful API for minting and validation
 - Docker-ready with GitHub Container Registry support
-- Stateless operation (no database required for basic minting)
 
 ---
 
-## ARK Structure
+## ARK Primer
 
-### **Basic Format**
-
-```
-[https://NMA/]ark:[/]NAAN/Name[Qualifier]
-
-Components:
-- NMA: Name Mapping Authority (hostname, optional and mutable)
-- ark: or ark:/ - the ARK label
-- NAAN: Name Assigning Authority Number (required, immutable)
-- Name: The assigned identifier (required, immutable)
-- Qualifier: Optional extensions (mutable)
-```
-
-**Modern vs Classic Forms:**
-ARKs can appear in two equivalent forms: modern (ark:) and classic (ark:/), differing only by the slash. These forms are considered identical in perpetuity, and resolvers should accept both.
-
-Example:
+### Structure
 
 ```
-https://example.org/ark:12345/x54xz321/page2.pdf
-https://example.org/ark:/12345/x54xz321/page2.pdf  # equivalent
+ark:[/]NAAN/shoulder+blade[/qualifier]
 ```
 
-## NAAN (Name Assigning Authority Number)
+**Example:** `ark:12345/x6np1wh8kq/page2.pdf`
 
-NAANs are opaque strings of one or more betanumeric characters. Since 2001, every assigned NAAN has consisted of exactly five digits. Implementations must support a minimum NAAN length of 16 octets.
+- **NAAN** (12345): Name Assigning Authority Number - your organization's identifier
+- **Shoulder** (x6): Namespace prefix ending in a digit - separates projects/collections
+- **Blade** (np1wh8kq): The unique identifier, optionally ending with a check character
+- **Qualifier** (page2.pdf): Optional path for variants/components
 
-## Shoulders
+Both `ark:` and `ark:/` forms are equivalent.
 
-A primordinal shoulder is a sequence of one or more betanumeric characters ending in a digit. This is the "first-digit convention" where the shoulder is all letters after the NAAN up to and including the first digit encountered.
+### Shoulders
 
-Examples:
+A shoulder is a string of betanumeric characters ending in a digit (the "first-digit convention"):
 
 ```
 ark:12345/x6np1wh8k    # shoulder is "x6"
@@ -57,157 +43,124 @@ ark:12345/b3th89n      # shoulder is "b3"
 ark:12345/abc7defg     # shoulder is "abc7"
 ```
 
-**Critical rule:** Do not use any delimiter (especially "/") between the shoulder string and blade string, as "/" declares an object boundary.
+**Critical:** Never use "/" between shoulder and blade:
 
 ```
-✓ ark:12345/x6np1wh8k/c2/s4.pdf   # correct
-✗ ark:12345/x6/np1wh8k/c2/s4.pdf  # WRONG - "/" after shoulder
+ark:12345/x6np1wh8k/page2.pdf   # correct
+ark:12345/x6/np1wh8k/page2.pdf  # WRONG
 ```
 
-**Unlimited shoulders:** With primordinal convention, you get infinite potential shoulders: b3, c3, d3, ... bb3, bc3, bd3, ... bbb3, etc.
+### Betanumeric Character Set
 
-## Character Set: Betanumeric
-
-The betanumeric character set consists of digits and consonants minus the letter 'l' (ell):
+ARKs use "betanumeric" characters - digits and consonants (excluding 'l'):
 
 ```
 bcdfghjkmnpqrstvwxz0123456789
 ```
 
-**Why betanumeric?**
+This avoids vowels (prevents accidental words), excludes confusable characters ('l'/'1', 'o'/'0'), and provides a prime radix (29) for the check character algorithm.
 
-1. Avoids vowels → prevents accidental word formation
-2. Excludes 'l' (ell) → prevents confusion with '1' (one)
-3. Excludes 'o' (oh) → prevents confusion with '0' (zero)
-4. Prime radix of R=29 → enables strong check character algorithm
+**Case sensitivity:** ARKs are technically case-sensitive, meaning `ark:12345/x6ABC` and `ark:12345/x6abc` are different identifiers. However, this service (like most ARK minters) generates only lowercase identifiers. An important quirk: uppercase and lowercase variants of the same string produce the same check character, since NCDA treats them identically for calculation purposes.
 
-**Case sensitivity:** ARKs distinguish between lower and upper case letters, which makes shorter identifiers possible (52 vs 26 letters per character position). However, the "ARK way" is to use lowercase only unless you need shorter ARKs.
+### Check Characters (NCDA)
 
-## Allowed Characters
-
-You can use digits, letters (ASCII, no diacritics), and the following characters: = @ \* + , \_ $ . - ! ~ ' ( ) %
-
-## Identity-Inert Hyphens
-
-Hyphens may appear but are identity inert, meaning strings that differ only by hyphens are considered identical:
+The Noid Check Digit Algorithm appends a check character to detect transcription errors:
 
 ```
-ark:12345/141e86dc-d396-4e59-bbc2-4c3bf5326152
-ark:12345/141e86dcd3964e59bbc24c3bf5326152
-# These identify the same thing
+Example: ark:13030/xf93gt2q
+                          ^-- check character
 ```
 
-This protects against text formatting processes that routinely introduce hyphens.
+The algorithm multiplies each character's ordinal value by its position, sums them, takes modulo 29, and maps back to a betanumeric character. It guarantees detection of:
 
-## NCDA: Noid Check Digit Algorithm
+- All single character errors
+- All adjacent transposition errors
+- Works for identifiers < 29 characters
 
-The Noid Check Digit Algorithm (NCDA) computes a check character that is appended to the tip of the blade (the last character of the base identifier). It guarantees the base identifier against the most common transcription errors: transposition of two adjacent characters and single character errors.
+**Note:** Check characters protect only the base identifier (NAAN + shoulder + blade), not qualifiers.
 
-**Note on terminology**: The algorithm is called "Check **Digit** Algorithm" for historical reasons, but it actually produces a "check **character**" since the result can be a letter (like 'q') or a digit (like '2').
+**Learn more:** [ARK Specification (IETF)](https://www.ietf.org/archive/id/draft-kunze-ark-34.html) | [NCDA Details](https://metacpan.org/dist/Noid/view/noid#NOID-CHECK-DIGIT-ALGORITHM)
 
-### **Algorithm Details:**
+---
 
-NCDA uses a prime radix of R=29 (the betanumeric repertoire) and guarantees detection of single-character and transposition errors for strings less than R=29 characters in length.
+## Design Philosophy & Tradeoffs
 
-**Implementation**:
+This service differs significantly from traditional ARK minters like Noid and EZID.
 
-```
-Step 1: Convert each betanumeric character to its ordinal value:
-        0-9 → 0-9
-        bcdfghjkmnpqrstvwxz → 10-28 (in that order)
+### Architecture Decisions
 
-Step 2: Multiply each character's ordinal value by its position
-        (starting at position 1) and sum the products.
+**Stateless random generation:**
 
-Example: 13030/xf93gt2
-  char:  1   3   0   3   0   /   x   f   9   3   g   t   2
-  ord:   1   3   0   3   0   0  27  13   9   3  14  24   2
-  pos:   1   2   3   4   5   6   7   8   9  10  11  12  13
-  prod:  1 + 6 + 0 +12 + 0 + 0+189+104+81+30+154+288+26 = 891
+- No database or persistent storage required
+- Fast, horizontally scalable, container-friendly
+- **No collision detection** - suitable for moderate volumes only (see blade length guidelines)
+- **No uniqueness guarantees** across service restarts
+- You must manage ARK-to-resource mappings in your own system
 
-Step 3: The check character is determined by taking the sum modulo 29
-        and finding the character at that ordinal position.
+**What's included:**
 
-        891 mod 29 = 21
-        Character with ordinal 21 = 'q'
+- Random identifier generation (betanumeric + optional NCDA check characters)
+- Multi-shoulder namespace support
+- Template-based URL resolution (302 redirects)
+- Validation API for check characters and structure
 
-Result: 13030/xf93gt2q (with check character appended)
-```
+**What's NOT included (vs Noid/EZID):**
 
-**What it protects:**
+- ARK binding (associating metadata/URLs with ARKs)
+- Sequential/patterned minting (no `.rdde`/`.zeddk` templates)
+- Persistent storage of minted ARKs
+- Hold/queue/peppermint functionality
+- Update/fetch operations
+- Collision detection or duplicate prevention
 
-- ✅ All single character errors
-- ✅ All adjacent transposition errors
-- ✅ Works for strings < 29 characters
-- ❌ Does NOT protect qualifiers (the parts after the base identifier)
+### When to Use This Service
 
-**Example of protected portion:**
+**Good fit:**
 
-```
-https://example.org/ark:13030/tqb3kh8w/chap3/fig5.jpg
-                            \________/
-                        check character protects this
-```
+- You need a simple ARK minter for moderate-scale projects
+- You have your own database for tracking ARK → resource mappings
+- You want stateless, containerized infrastructure
+- Your minting volumes align with the collision risk profiles (see configuration)
 
-**References:**
+**Not a good fit:**
 
-- [NOID Check Digit Algorithm specification](https://metacpan.org/dist/Noid/view/noid#NOID-CHECK-DIGIT-ALGORITHM)
-- [ARK Specification (IETF)](https://www.ietf.org/archive/id/draft-kunze-ark-34.html)
+- You need Noid's full feature set (bind, fetch, update)
+- You require guaranteed unique ARKs without external tracking
+- You need sequential or patterned identifiers
+- You're minting millions of ARKs and need collision detection
+- You want an all-in-one resolver with metadata storage
 
-## ARK Inflections
+### Comparison to Noid
 
-An inflection is a change to the ending of an identifier to express a shift in meaning. Adding '?' to an ARK requests metadata without defining a separate identifier.
+| Feature               | This Service               | Noid                         |
+| --------------------- | -------------------------- | ---------------------------- |
+| Identifier generation | Random only                | Random + sequential patterns |
+| Storage               | Stateless (no DB)          | Berkeley DB                  |
+| Binding ARKs to URLs  | No (you manage externally) | Yes (bind command)           |
+| Collision detection   | No                         | Yes                          |
+| Scalability           | Horizontal (stateless)     | Vertical (single DB)         |
+| Setup complexity      | Low (env vars)             | Medium (DB + templates)      |
+| Shoulders             | Yes (multiple)             | Yes (via templates)          |
+| Check characters      | Yes (NCDA)                 | Yes (NCDA)                   |
 
-```
-ark:12345/x54xz321        # → object
-ark:12345/x54xz321?       # → metadata
-ark:12345/x54xz321??      # → commitment statement
-```
+This service is essentially a stateless random ARK generator with validation - think of it as a building block you integrate into your own system, rather than a complete ARK management solution.
 
-## Qualifiers (Extensions)
+---
 
-After the base identifier, you can add qualifiers to identify parts or components of the main object:
+## Roadmap
 
-```
-ark:12345/x54xz321/page2.pdf
-ark:12345/x54xz321/chapter3/figure5
-                  \_______________/
-                     qualifiers
-```
+This is an MVP focused on the core ARK minting functionality. Future enhancements under consideration:
 
-**Common uses for qualifiers:**
+**Planned features:**
 
-Qualifiers primarily express "part of" relationships, identifying components, versions, or manifestations of the main object:
+- **Persistent storage backend** - Optional database support for collision detection and ARK tracking
+- **Additional minting algorithms** - Sequential identifiers, custom patterns beyond random generation
+- **ARK binding** - Associate metadata and URLs with minted ARKs (making it a true resolver)
+- **Collision detection** - Track minted ARKs to guarantee uniqueness
+- **Metrics and monitoring** - Prometheus endpoints, minting statistics, usage tracking
 
-- **Pages and sections**: `ark:12345/x8rd9/page5`, `ark:12345/x8rd9/chapter3`
-- **File formats**: `ark:12345/x8rd9/thumbnail.jpg`, `ark:12345/x8rd9/fullres.tif`
-- **Versions**: `ark:12345/x8rd9/v2`, `ark:12345/x8rd9/2024-01-15`
-- **Metadata views**: `ark:12345/x8rd9/metadata.xml`, `ark:12345/x8rd9/dc`
-- **Hierarchical parts**: `ark:12345/x8rd9/volume2/section3/figure12`
-
-The base ARK (`ark:12345/x54xz321`) identifies the primary object, while qualifiers identify subordinate parts. This allows a single ARK to serve as the root for an entire hierarchy of related resources.
-
-**Important notes:**
-
-- Check characters are not expected to cover qualifiers, which often name subobjects that are less stable than the parent object.
-- Qualifiers are mutable and can be added or changed without affecting the identity of the base ARK.
-- The "/" character in qualifiers creates natural hierarchy and expresses containment relationships.
-
-## Opacity Recommendations
-
-Semantic opaqueness in the Name part is strongly encouraged to reduce vulnerability to era- and language-specific change. Names that look more or less like numbers avoid common problems. Mixing in betanumerics achieves a denser namespace.
-
-## Summary Table
-
-| Component       | Rules                             | Example               |
-| --------------- | --------------------------------- | --------------------- |
-| NAAN            | 5 digits (currently), betanumeric | 12345                 |
-| Shoulder        | Primordinal (ends with digit)     | x6, b3, abc7          |
-| Blade           | Betanumeric + check character     | np1wh8k (+ check)     |
-| Characters      | Betanumeric preferred             | bcdfg...0-9           |
-| Check character | NCDA algorithm, mod 29            | Last char of blade    |
-| Hyphens         | Identity-inert                    | Can add/remove freely |
-| Case            | Sensitive but lowercase preferred | Use lowercase         |
+**Why not now?**
+The current stateless design addresses the most common use case: fast, simple ARK generation for projects that manage their own ARK-to-resource mappings. Adding these features would increase complexity, so they're being considered based on real-world usage patterns and community feedback.
 
 ---
 

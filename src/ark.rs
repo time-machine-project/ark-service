@@ -1,9 +1,9 @@
 use crate::AppError;
 
 /// An ARK identifier parsed into its components
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Ark {
-    /// The complete ark identifier
+    /// The complete ark identifier, normalized to the modern format
     pub ark: String,
     /// The NAAN (Name Assigning Authority Number)
     pub naan: String,
@@ -104,8 +104,6 @@ mod tests {
         let modern = parse_ark("ark:12345/x6np1wh8k").unwrap();
         let classic = parse_ark("ark:/12345/x6np1wh8k").unwrap();
 
-        assert_eq!(modern.naan, classic.naan);
-        assert_eq!(modern.shoulder, classic.shoulder);
-        assert_eq!(modern.blade, classic.blade);
+        assert_eq!(modern, classic);
     }
 }

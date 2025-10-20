@@ -14,8 +14,6 @@ ARK Service is a Rust-based web service that generates random ARK identifiers wi
 - RESTful API for minting and validation
 - Docker-ready with GitHub Container Registry support
 
----
-
 ## ARK Primer
 
 ### Structure
@@ -80,8 +78,6 @@ The algorithm multiplies each character's ordinal value by its position, sums th
 **Note:** Check characters protect only the base identifier (NAAN + shoulder + blade), not qualifiers.
 
 **Learn more:** [ARK Specification (IETF)](https://www.ietf.org/archive/id/draft-kunze-ark-34.html) | [NCDA Details](https://metacpan.org/dist/Noid/view/noid#NOID-CHECK-DIGIT-ALGORITHM)
-
----
 
 ## Design Philosophy & Tradeoffs
 
@@ -196,8 +192,6 @@ curl http://localhost:3000/ark:12345/servicestatus
 OK
 ```
 
----
-
 #### 2. Get Service Info
 
 Get information about the NAAN and configured shoulders.
@@ -235,8 +229,6 @@ curl http://localhost:3000/api/v1/info
   ]
 }
 ```
-
----
 
 #### 3. Mint ARKs
 
@@ -294,8 +286,6 @@ curl -X POST http://localhost:3000/api/v1/mint \
   "error": "Shoulder not found: z9"
 }
 ```
-
----
 
 #### 4. Validate ARKs
 
@@ -413,8 +403,6 @@ curl -X POST http://localhost:3000/api/v1/validate \
 }
 ```
 
----
-
 #### 5. Resolve ARK
 
 Resolve an ARK identifier to its target URL. Returns a 302 redirect.
@@ -452,8 +440,6 @@ The `-L` flag in curl will automatically follow the redirect to the target URL.
 
 - `404 Not Found`: Shoulder not configured
 - `400 Bad Request`: Invalid ARK format or NAAN mismatch
-
----
 
 ### Configuration
 
@@ -569,8 +555,6 @@ The `route_pattern` field supports template variables for flexible URL construct
 ```
 
 **Note:** If no template variables are present in the route pattern, the full ARK identifier will be appended to the URL (N2T.net standard behavior).
-
----
 
 ### Running the Service
 

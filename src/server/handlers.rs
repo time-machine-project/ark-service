@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{OriginalUri, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -118,10 +118,18 @@ pub async fn validate_handler(
 
 pub async fn resolve_handler(
     State(state): State<Arc<AppState>>,
-    Path(ark_fragment): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<Response, AppError> {
-    let ark_string = format!("ark:{}", ark_fragment);
-    // Parse the full ARK string (e.g., "12345/x6np1wh8k/page2.pdf")
+    // Extract path and query from URI: /ark:12345/x6test?info -> ark:12345/x6test?info
+    let path_and_query = uri.path_and_query().ok_or(AppError::InvalidArk)?.as_str();
+
+    // Remove leading /ark: to get just the ARK identifier
+    let ark_string = path_and_query
+        .strip_prefix("/ark:")
+        .ok_or(AppError::InvalidArk)?;
+
+    let ark_string = format!("ark:{}", ark_string);
+    // Parse the full ARK string (e.g., "ark:12345/x6np1wh8k/page2.pdf?info")
     let parsed_ark = Ark::try_from(ark_string.as_str())?;
 
     // Check NAAN matches
@@ -262,9 +270,9 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_handler_success() {
         let state = create_test_state();
-        let ark_fragment = "12345/x6np1wh8k".to_string();
+        let uri = axum::http::Uri::from_static("/ark:12345/x6np1wh8k");
 
-        let result = resolve_handler(State(state), Path(ark_fragment)).await;
+        let result = resolve_handler(State(state), OriginalUri(uri)).await;
         assert!(result.is_ok());
 
         // Handler returns a redirect - verify it produces a response
@@ -279,9 +287,9 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_handler_with_qualifier() {
         let state = create_test_state();
-        let ark_fragment = "12345/x6np1wh8k/page2.pdf".to_string();
+        let uri = axum::http::Uri::from_static("/ark:12345/x6np1wh8k/page2.pdf");
 
-        let result = resolve_handler(State(state), Path(ark_fragment)).await;
+        let result = resolve_handler(State(state), OriginalUri(uri)).await;
         assert!(result.is_ok());
 
         // Handler returns a redirect - verify it produces a response
@@ -296,9 +304,9 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_handler_invalid_naan() {
         let state = create_test_state();
-        let ark_fragment = "99999/x6np1wh8k".to_string(); // Wrong NAAN
+        let uri = axum::http::Uri::from_static("/ark:99999/x6np1wh8k");
 
-        let result = resolve_handler(State(state), Path(ark_fragment)).await;
+        let result = resolve_handler(State(state), OriginalUri(uri)).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AppError::InvalidNaan));
     }
@@ -306,9 +314,9 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_handler_shoulder_not_found() {
         let state = create_test_state();
-        let ark_fragment = "12345/z9unknown".to_string(); // Unregistered shoulder
+        let uri = axum::http::Uri::from_static("/ark:12345/z9unknown");
 
-        let result = resolve_handler(State(state), Path(ark_fragment)).await;
+        let result = resolve_handler(State(state), OriginalUri(uri)).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AppError::ShoulderNotFound));
     }
@@ -316,10 +324,26 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_handler_invalid_ark_format() {
         let state = create_test_state();
-        let ark_fragment = "invalid".to_string(); // Invalid ARK
+        let uri = axum::http::Uri::from_static("/ark:invalid");
 
-        let result = resolve_handler(State(state), Path(ark_fragment)).await;
+        let result = resolve_handler(State(state), OriginalUri(uri)).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AppError::InvalidArk));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handler_with_query_string() {
+        let state = create_test_state();
+        let uri = axum::http::Uri::from_static("/ark:12345/x6np1wh8k?info");
+
+        let result = resolve_handler(State(state), OriginalUri(uri)).await;
+        assert!(result.is_ok());
+
+        let response = result.unwrap().into_response();
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        // Verify Location header includes query string
+        let location = response.headers().get(header::LOCATION).unwrap();
+        assert_eq!(location, "https://example.org/x6np1wh8k?info");
     }
 }

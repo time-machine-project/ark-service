@@ -252,7 +252,7 @@ impl Shoulder {
             Err(e) => {
                 tracing::error!(
                     shoulder = %parsed_ark.shoulder,
-                    ark = %parsed_ark.ark,
+                    ark = %parsed_ark.original,
                     attempted_target = %target,
                     error = %e,
                     "SECURITY: Invalid redirect URL blocked"
@@ -275,8 +275,7 @@ impl Shoulder {
     /// If no template variables are present in the route_pattern, the full ARK
     /// identifier is appended to the base URL (N2T.net standard behavior).
     fn apply_template(&self, parsed_ark: &Ark) -> String {
-        // Extract ARK components
-        let pid = &parsed_ark.ark;
+        let pid = &parsed_ark.original;
         let scheme = "ark";
         let content = if parsed_ark.qualifier.is_empty() {
             format!(
@@ -292,7 +291,14 @@ impl Shoulder {
         let prefix = &parsed_ark.naan;
         let value = if parsed_ark.qualifier.is_empty() {
             format!("{}{}", parsed_ark.shoulder, parsed_ark.blade)
+        } else if parsed_ark.qualifier.starts_with('?') {
+            // Query string without path qualifier - no slash needed
+            format!(
+                "{}{}{}",
+                parsed_ark.shoulder, parsed_ark.blade, parsed_ark.qualifier
+            )
         } else {
+            // Path qualifier - include slash
             format!(
                 "{}{}/{}",
                 parsed_ark.shoulder, parsed_ark.blade, parsed_ark.qualifier
@@ -856,6 +862,46 @@ mod tests {
         assert_eq!(
             shoulder.resolve(&parsed),
             "https://example.org/items/x6np1wh8k"
+        );
+    }
+
+    #[test]
+    fn test_resolve_with_query_string() {
+        // Test that query strings are forwarded with template variables
+        let ark = "ark:12345/x6np1wh8k?info";
+        let parsed = parse_ark(ark).unwrap();
+
+        // Test with ${value} template
+        let shoulder = Shoulder {
+            route_pattern: "https://example.org/items/${value}".to_string(),
+            project_name: "Test".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            shoulder.resolve(&parsed),
+            "https://example.org/items/x6np1wh8k?info"
+        );
+
+        // Test with ${pid} template
+        let shoulder2 = Shoulder {
+            route_pattern: "https://example.org/resolve?id=${pid}".to_string(),
+            project_name: "Test".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            shoulder2.resolve(&parsed),
+            "https://example.org/resolve?id=ark:12345/x6np1wh8k?info"
+        );
+
+        // Test with no template variables
+        let shoulder3 = Shoulder {
+            route_pattern: "https://example.org/".to_string(),
+            project_name: "Test".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            shoulder3.resolve(&parsed),
+            "https://example.org/ark:12345/x6np1wh8k?info"
         );
     }
 

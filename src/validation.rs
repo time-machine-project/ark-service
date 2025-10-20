@@ -332,8 +332,8 @@ mod tests {
     #[test]
     fn test_validate_invalid_blade_with_special_char() {
         let state = create_test_state();
-        // Blade with special character (before any qualifier)
-        let result = validate_ark(&state, "ark:/12345/x6nmkd-123", None);
+        // Blade with special character '@'
+        let result = validate_ark(&state, "ark:/12345/x6nmkd@123", None);
 
         assert!(!result.valid);
         assert!(result.error.is_some());

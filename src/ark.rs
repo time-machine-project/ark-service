@@ -1,396 +1,368 @@
-use crate::AppError;
+//! ARK parsing and normalization per draft-kunze-ark-43.
 
-/// An ARK identifier parsed into its components
+use std::fmt;
+
+/// The betanumeric alphabet (§2.3), in the ordinal order of the NCDA.
+pub const BETANUMERIC: &[u8] = b"0123456789bcdfghjkmnpqrstvwxz";
+
+pub const LABEL: &str = "ark:";
+const OLD_LABEL: &str = "ark:/";
+
+pub fn is_betanumeric(s: &str) -> bool {
+    s.bytes().all(|b| BETANUMERIC.contains(&b))
+}
+
+/// Whether `s` starts with the label "ark:" in any letter case.
+pub fn has_label(s: &str) -> bool {
+    starts_with_ignore_case(s, LABEL)
+}
+
+/// The string a check character covers (§2): NAAN, '/', shoulder and blade.
+pub fn check_zone(naan: &str, shoulder: &str, blade: &str) -> String {
+    format!("{naan}/{shoulder}{blade}")
+}
+
+/// Whether `s` is a primordinal shoulder (§2.4.1) and nothing else.
+pub fn is_primordinal_shoulder(s: &str) -> bool {
+    split_primordinal_shoulder(s) == (Some(s), "")
+}
+
+/// Why a string is not an ARK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseError {
+    MissingLabel,
+    MissingNaan,
+    MissingName,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ParseError::MissingLabel => "Missing \"ark:\" label",
+            ParseError::MissingNaan => "Missing NAAN",
+            ParseError::MissingName => "Missing Name after the NAAN",
+        })
+    }
+}
+
+/// Why a parsed ARK does not conform to the spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Violation {
+    NaanNotBetanumeric,
+    CharacterOutsideRepertoire,
+    MalformedPercentEncoding,
+}
+
+impl fmt::Display for Violation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Violation::NaanNotBetanumeric => "NAAN contains non-betanumeric characters",
+            Violation::CharacterOutsideRepertoire => {
+                "Name or qualifier contains characters outside the ARK repertoire"
+            }
+            Violation::MalformedPercentEncoding => "'%' is not followed by two hex digits",
+        })
+    }
+}
+
+/// An ARK split into its normalized components, keeping the string as received.
 ///
-/// This struct stores components in their original form (preserving hyphens, case, query strings, etc.)
-/// for use in resolution and forwarding. The `normalized_ark` field contains a fully
-/// normalized version used only for equality comparison per RFC specifications.
+/// Matching and validation use the normalized components. Forwarding uses the received
+/// string after the §3.1 cleanup, with the label written as "ark:" and nothing between the
+/// label and the NAAN.
 #[derive(Debug, Clone)]
 pub struct Ark {
-    /// The original ARK string as received (only ark:/ normalized to ark)
-    pub original: String,
-    /// The NAAN (Name Assigning Authority Number) as received
-    pub naan: String,
-    /// The shoulder (prefix) of the ARK as received
-    pub shoulder: String,
-    /// The blade (unique identifier) of the ARK as received
-    pub blade: String,
-    /// The qualifier (optional additional path) of the ARK as received. This includes any query
-    /// string.
-    pub qualifier: String,
-    /// Fully normalized ARK for equality comparison only (lowercase NAAN, hyphens removed, etc.)
-    pub normalized_ark: String,
+    received: String,
+    naan_end: usize,
+    path_end: usize,
+    naan: String,
+    shoulder: Option<String>,
+    blade: String,
+    qualifier: String,
+    normalized: String,
 }
 
 impl PartialEq for Ark {
     fn eq(&self, other: &Self) -> bool {
-        // Equality is based solely on the normalized form per RFC
-        self.normalized_ark == other.normalized_ark
+        self.normalized == other.normalized
     }
 }
 
 impl Eq for Ark {}
 
-impl TryFrom<&str> for Ark {
-    type Error = AppError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        parse_ark(value).ok_or(AppError::InvalidArk)
+impl Ark {
+    /// The ARK as received from its label on, including any query string.
+    pub fn received(&self) -> &str {
+        &self.received
     }
-}
 
-impl TryFrom<String> for Ark {
-    type Error = AppError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        value.as_str().try_into()
+    /// The ARK as received from its label on, without the query string.
+    pub fn pid(&self) -> &str {
+        &self.received[..self.path_end]
     }
-}
 
-/// Extract shoulder from ARK path (primordial shoulder: letters ending with first digit)
-pub fn extract_shoulder(path: &str) -> Option<&str> {
-    for (byte_idx, ch) in path.char_indices() {
-        if ch.is_ascii_digit() {
-            return Some(&path[..=byte_idx]);
+    /// Everything after the label up to the query string, as received.
+    pub fn content(&self) -> &str {
+        &self.received[LABEL.len()..self.path_end]
+    }
+
+    /// The NAAN as received.
+    pub fn prefix(&self) -> &str {
+        &self.received[LABEL.len()..self.naan_end]
+    }
+
+    /// Everything after the NAAN and its '/' up to the query string, as received.
+    pub fn value(&self) -> &str {
+        self.received
+            .get(self.naan_end + 1..self.path_end)
+            .unwrap_or("")
+    }
+
+    /// The query string after the first '?', which carries inflections such as `info`.
+    pub fn query(&self) -> Option<&str> {
+        split_query(&self.received).1
+    }
+
+    pub fn naan(&self) -> &str {
+        &self.naan
+    }
+
+    /// The primordinal shoulder (§2.4.1), if the Name starts with one.
+    pub fn shoulder(&self) -> Option<&str> {
+        self.shoulder.as_deref()
+    }
+
+    /// The rest of the base Name after the shoulder, or the whole base Name without one.
+    pub fn blade(&self) -> &str {
+        &self.blade
+    }
+
+    /// The `ComponentPath` and `VariantPath` (§2.5), including the leading '/' or '.'.
+    pub fn qualifier(&self) -> &str {
+        &self.qualifier
+    }
+
+    /// The normalized ARK (§3.2), used for lexical equivalence.
+    pub fn normalized(&self) -> &str {
+        &self.normalized
+    }
+
+    pub fn check_zone(&self) -> String {
+        check_zone(
+            &self.naan,
+            self.shoulder.as_deref().unwrap_or(""),
+            &self.blade,
+        )
+    }
+
+    /// The first rule of §2.3 and §3.1 this ARK breaks, if any.
+    pub fn violation(&self) -> Option<Violation> {
+        if !is_betanumeric(&self.naan) {
+            return Some(Violation::NaanNotBetanumeric);
         }
+        let name = &self.normalized.as_bytes()[LABEL.len() + self.naan.len() + 1..];
+        for (i, &b) in name.iter().enumerate() {
+            if b == b'%' {
+                let escape = name.get(i + 1..i + 3);
+                if !escape.is_some_and(|e| e.iter().all(u8::is_ascii_hexdigit)) {
+                    return Some(Violation::MalformedPercentEncoding);
+                }
+            } else if !(b.is_ascii_alphanumeric() || b"=~*+@_$./".contains(&b)) {
+                return Some(Violation::CharacterOutsideRepertoire);
+            }
+        }
+        None
     }
-    None
 }
 
-/// Normalize an ARK string according to RFC specifications
-/// Returns a fully normalized ARK suitable for comparison
-fn normalize_ark_string(ark: &str) -> String {
-    // Remove query string (everything from first '?' onwards)
-    let ark = ark.split('?').next().unwrap_or(ark);
+/// Parse an ARK, with or without an NMA in front of it.
+pub fn parse_ark(input: &str) -> Result<Ark, ParseError> {
+    let cleaned = clean_transcription(input);
+    let from_label = strip_nma(&cleaned).ok_or(ParseError::MissingLabel)?;
+    let normalized = normalize(from_label);
 
-    // Handle both ark: and ark:/ formats
-    let ark = ark.replace("ark:/", "ark:");
-
-    // Remove whitespace (spaces, tabs, newlines, etc.) that may have been introduced
-    // during text wrapping or copy-paste operations
-    let mut ark = ark
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>();
-
-    // Remove hyphens (standard ASCII hyphen)
-    ark = ark.replace("-", "");
-
-    // Remove hyphen-like characters
-    ark = ark.replace('\u{2010}', ""); // U+2010: ‐ (HYPHEN)
-    ark = ark.replace('\u{2011}', ""); // U+2011: ‑ (NON-BREAKING HYPHEN)
-    ark = ark.replace('\u{2012}', ""); // U+2012: ‒ (FIGURE DASH)
-    ark = ark.replace('\u{2013}', ""); // U+2013: – (EN DASH)
-    ark = ark.replace('\u{2014}', ""); // U+2014: — (EM DASH)
-    ark = ark.replace('\u{2015}', ""); // U+2015: ― (HORIZONTAL BAR)
-
-    // Lowercase the NAAN
-    if let Some(slash_pos) = ark.find('/').filter(|&pos| pos > 4) {
-        // Split into "ark:NAAN" and rest
-        let (prefix, rest) = ark.split_at(slash_pos);
-        let naan_part = &prefix[4..]; // Skip "ark:"
-        ark = format!("ark:{}{}", naan_part.to_lowercase(), rest);
+    let rest = &normalized[LABEL.len()..];
+    if rest.is_empty() {
+        return Err(ParseError::MissingNaan);
     }
+    let (naan, name) = rest.split_once('/').ok_or(ParseError::MissingName)?;
+    let base_end = name.find(['/', '.']).unwrap_or(name.len());
+    let (base, qualifier) = name.split_at(base_end);
+    let (shoulder, blade) = split_primordinal_shoulder(base);
 
-    // Strip trailing structural characters (/ and .) from the end
-    ark = ark.trim_end_matches(&['/', '.'][..]).to_string();
+    let content = &from_label[label_len(from_label)..];
+    let received = format!("{LABEL}{}", content.trim_start_matches(['/', '.', '-']));
 
-    ark
-}
-
-/// Parse an ARK identifier into its components
-///
-/// Parses an ARK and stores components in their original form (preserving hyphens, case, query strings, etc.)
-/// except for ark:/ -> ark: conversion. A fully normalized version is computed and stored internally
-/// for equality comparison (which removes query strings per RFC).
-pub fn parse_ark(ark: &str) -> Option<Ark> {
-    // Minimal normalization - ONLY normalize ark:/ to ark:
-    let original_form = ark.replace("ark:/", "ark:");
-
-    if !original_form.starts_with("ark:") {
-        return None;
-    }
-
-    // Parse components - query string becomes part of the qualifier
-    let original_remainder = &original_form[4..]; // Skip "ark:"
-    let mut original_parts = original_remainder.splitn(2, '/');
-    let naan = original_parts.next()?.to_string();
-    let rest = original_parts.next()?;
-
-    // Extract shoulder from the part before query string
-    let rest_without_query = rest.split('?').next().unwrap_or(rest);
-    let shoulder = extract_shoulder(rest_without_query)?.to_string();
-
-    // Extract blade (without query string) and qualifier (with query string)
-    let after_shoulder = &rest[shoulder.len()..];
-
-    // Find where the blade ends (either at '/' or '?')
-    let blade_end = after_shoulder
-        .find('/')
-        .or_else(|| after_shoulder.find('?'));
-
-    let (blade, qualifier) = if let Some(end_pos) = blade_end {
-        let blade = after_shoulder[..end_pos].to_string();
-        let qualifier_start = if after_shoulder.as_bytes()[end_pos] == b'/' {
-            end_pos + 1 // Skip the '/'
-        } else {
-            end_pos // Keep the '?' as part of qualifier
-        };
-        (blade, after_shoulder[qualifier_start..].to_string())
-    } else {
-        (after_shoulder.to_string(), String::new())
-    };
-
-    // Get fully normalized version for comparison
-    let normalized_ark = normalize_ark_string(ark);
-
-    Some(Ark {
-        original: original_form,
-        naan,
-        shoulder,
-        blade,
-        qualifier,
-        normalized_ark,
+    Ok(Ark {
+        naan_end: naan_end(&received),
+        path_end: split_query(&received).0.len(),
+        received,
+        naan: naan.to_string(),
+        shoulder: shoulder.map(str::to_string),
+        blade: blade.to_string(),
+        qualifier: qualifier.to_string(),
+        normalized,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// §3.2 steps 2 to 8, for an ARK that starts with its label.
+///
+/// Step 7 removes no inflections: this resolver forwards them to the target, and step 2 has
+/// already removed the query string that carries `?info`.
+fn normalize(ark: &str) -> String {
+    let ark = strip_query(ark);
+    let ark = normalize_label(ark);
+    let ark = lowercase_naan(&ark);
+    let ark = uppercase_percent_escapes(&ark);
+    let ark = remove_hyphens(&ark);
+    normalize_structural_characters(&ark)
+}
 
-    #[test]
-    fn test_shoulder_extraction() {
-        assert_eq!(extract_shoulder("x6np1wh8k"), Some("x6"));
-        assert_eq!(extract_shoulder("b3test"), Some("b3"));
-        assert_eq!(extract_shoulder("abc7def"), Some("abc7"));
-        assert_eq!(extract_shoulder("xyz"), None); // No digit
+/// §3.1: remove whitespace and turn hyphen-like characters into hyphens.
+fn clean_transcription(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| {
+            if ('\u{2010}'..='\u{2015}').contains(&c) {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Step 1: remove the NMA, everything up to the '/' of the first "/ark:" in its path.
+fn strip_nma(ark: &str) -> Option<&str> {
+    if has_label(ark) {
+        return Some(ark);
     }
+    let path_start = scheme_len(ark).map_or(0, |scheme_len| {
+        let host_start = scheme_len + "://".len();
+        ark[host_start..]
+            .find('/')
+            .map_or(ark.len(), |i| host_start + i)
+    });
+    split_query(&ark[path_start..])
+        .0
+        .to_ascii_lowercase()
+        .find("/ark:")
+        .map(|i| &ark[path_start + i + 1..])
+}
 
-    #[test]
-    fn test_ark_parsing() {
-        let ark = "ark:12345/x6np1wh8k/nl7l/page2.pdf";
-        let parsed = parse_ark(ark).unwrap();
+/// Step 2: remove the query string.
+fn strip_query(ark: &str) -> &str {
+    split_query(ark).0
+}
 
-        assert_eq!(parsed.naan, "12345");
-        assert_eq!(parsed.shoulder, "x6");
-        assert_eq!(parsed.blade, "np1wh8k");
-        assert_eq!(parsed.qualifier, "nl7l/page2.pdf");
+/// Splits at the first '?' into the part before it and the query string after it.
+fn split_query(s: &str) -> (&str, Option<&str>) {
+    match s.split_once('?') {
+        Some((before, query)) => (before, Some(query)),
+        None => (s, None),
     }
+}
 
-    #[test]
-    fn test_ark_parsing_both_formats() {
-        let modern = parse_ark("ark:12345/x6np1wh8k").unwrap();
-        let classic = parse_ark("ark:/12345/x6np1wh8k").unwrap();
+/// The length of a URI scheme (RFC 3986) followed by "://" at the start of `s`.
+fn scheme_len(s: &str) -> Option<usize> {
+    let len = s.find("://")?;
+    let scheme = &s.as_bytes()[..len];
+    let valid = scheme.first().is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(b));
+    valid.then_some(len)
+}
 
-        assert_eq!(modern, classic);
+/// Step 3: turn the first "ark:/" or "ark:", in any case, into "ark:".
+fn normalize_label(ark: &str) -> String {
+    format!("{LABEL}{}", &ark[label_len(ark)..])
+}
+
+/// Step 4: lowercase the NAAN.
+fn lowercase_naan(ark: &str) -> String {
+    let end = naan_end(ark);
+    format!(
+        "{LABEL}{}{}",
+        ark[LABEL.len()..end].to_ascii_lowercase(),
+        &ark[end..]
+    )
+}
+
+/// Step 5: uppercase the two characters after every '%'.
+fn uppercase_percent_escapes(ark: &str) -> String {
+    let mut pending = 0u8;
+    ark.chars()
+        .map(|c| {
+            let out = if pending > 0 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            };
+            pending = if c == '%' {
+                2
+            } else {
+                pending.saturating_sub(1)
+            };
+            out
+        })
+        .collect()
+}
+
+/// Step 6: remove all hyphens.
+fn remove_hyphens(ark: &str) -> String {
+    ark.replace('-', "")
+}
+
+/// Step 8: drop initial and final '/' and '.', and collapse runs of them to their first character.
+fn normalize_structural_characters(ark: &str) -> String {
+    let mut out = String::from(LABEL);
+    let mut after_structural = true;
+    for c in ark[LABEL.len()..].chars() {
+        let structural = c == '/' || c == '.';
+        if !(structural && after_structural) {
+            out.push(c);
+        }
+        after_structural = structural;
     }
-
-    #[test]
-    fn test_hyphen_removal() {
-        // Per RFC 3.1: hyphens are identity-inert for COMPARISON
-        // But we store the original form for resolution
-        let with_hyphens = parse_ark("ark:12345/x5-4-xz-321").unwrap();
-        let without_hyphens = parse_ark("ark:12345/x54xz321").unwrap();
-
-        // Equality comparison uses normalized form
-        assert_eq!(with_hyphens, without_hyphens);
-
-        // But original components are preserved
-        assert_eq!(with_hyphens.shoulder, "x5");
-        assert_eq!(with_hyphens.blade, "-4-xz-321"); // Hyphens preserved!
-
-        // Without hyphens has clean components
-        assert_eq!(without_hyphens.shoulder, "x5");
-        assert_eq!(without_hyphens.blade, "4xz321");
+    if out.len() > LABEL.len() && out.ends_with(['/', '.']) {
+        out.pop();
     }
+    out
+}
 
-    #[test]
-    fn test_hyphen_like_character_removal() {
-        // Test removal of Unicode hyphen-like characters (U+2010 to U+2015)
-        let with_en_dash = parse_ark("ark:12345/x6np–1wh8k").unwrap(); // U+2013 EN DASH
-        let with_em_dash = parse_ark("ark:12345/x6np—1wh8k").unwrap(); // U+2014 EM DASH
-        let normal = parse_ark("ark:12345/x6np1wh8k").unwrap();
-
-        assert_eq!(with_en_dash, normal);
-        assert_eq!(with_em_dash, normal);
+/// §2.4.1: one or more betanumeric characters ending in the first digit.
+fn split_primordinal_shoulder(base: &str) -> (Option<&str>, &str) {
+    for (i, b) in base.bytes().enumerate() {
+        if b.is_ascii_digit() {
+            return (Some(&base[..=i]), &base[i + 1..]);
+        }
+        if !BETANUMERIC.contains(&b) {
+            break;
+        }
     }
+    (None, base)
+}
 
-    #[test]
-    fn test_query_string_removal() {
-        // Per RFC 3.2: query strings must be removed during normalization FOR COMPARISON ONLY
-        let with_query = parse_ark("ark:12345/x6np1wh8k?foo=bar&baz=qux").unwrap();
-        let without_query = parse_ark("ark:12345/x6np1wh8k").unwrap();
-
-        // Equal for comparison (normalized form strips query string)
-        assert_eq!(with_query, without_query);
-
-        // But original preserves query string
-        assert_eq!(with_query.original, "ark:12345/x6np1wh8k?foo=bar&baz=qux");
-        assert_eq!(without_query.original, "ark:12345/x6np1wh8k");
+/// The length of the label "ark:/" or "ark:" that `ark` starts with.
+fn label_len(ark: &str) -> usize {
+    if starts_with_ignore_case(ark, OLD_LABEL) {
+        OLD_LABEL.len()
+    } else {
+        LABEL.len()
     }
+}
 
-    #[test]
-    fn test_query_string_with_qualifier() {
-        let with_query = parse_ark("ark:12345/x6np1wh8k/page2?foo=bar").unwrap();
-        let without_query = parse_ark("ark:12345/x6np1wh8k/page2").unwrap();
+/// The index of the '/' that ends the NAAN of an ARK starting with "ark:", or its length.
+fn naan_end(ark: &str) -> usize {
+    split_query(&ark[LABEL.len()..])
+        .0
+        .find('/')
+        .map_or(ark.len(), |i| LABEL.len() + i)
+}
 
-        // Equal for comparison
-        assert_eq!(with_query, without_query);
-
-        // Qualifier includes query string (for forwarding during resolution)
-        assert_eq!(with_query.qualifier, "page2?foo=bar");
-
-        // But original also includes query string
-        assert_eq!(with_query.original, "ark:12345/x6np1wh8k/page2?foo=bar");
-    }
-
-    #[test]
-    fn test_query_string_without_path_qualifier() {
-        // Query string becomes the qualifier when there's no path
-        let with_query = parse_ark("ark:12345/x6np1wh8k?info").unwrap();
-        let without_query = parse_ark("ark:12345/x6np1wh8k").unwrap();
-
-        // Equal for comparison (normalized form removes query)
-        assert_eq!(with_query, without_query);
-
-        // Components
-        assert_eq!(with_query.naan, "12345");
-        assert_eq!(with_query.shoulder, "x6");
-        assert_eq!(with_query.blade, "np1wh8k");
-        // Query string is the qualifier
-        assert_eq!(with_query.qualifier, "?info");
-
-        // Without query has empty qualifier
-        assert_eq!(without_query.qualifier, "");
-    }
-
-    #[test]
-    fn test_trailing_slash_removal() {
-        // Per RFC 3.2: trailing slashes should be removed
-        let with_trailing = parse_ark("ark:12345/x6np1wh8k/").unwrap();
-        let without_trailing = parse_ark("ark:12345/x6np1wh8k").unwrap();
-
-        assert_eq!(with_trailing, without_trailing);
-    }
-
-    #[test]
-    fn test_trailing_period_removal() {
-        // Per RFC 3.2: trailing periods should be removed
-        let with_trailing = parse_ark("ark:12345/x6np1wh8k.").unwrap();
-        let without_trailing = parse_ark("ark:12345/x6np1wh8k").unwrap();
-
-        assert_eq!(with_trailing, without_trailing);
-    }
-
-    #[test]
-    fn test_trailing_structural_chars_on_qualifier() {
-        // Trailing chars are preserved in original, but removed in normalized
-        let ark = parse_ark("ark:12345/x6np1wh8k/page2.pdf/").unwrap();
-        assert_eq!(ark.qualifier, "page2.pdf/"); // Original preserved
-
-        let ark2 = parse_ark("ark:12345/x6np1wh8k/page2.").unwrap();
-        assert_eq!(ark2.qualifier, "page2."); // Original preserved
-
-        // But they're equal to versions without trailing chars (normalized comparison)
-        let clean1 = parse_ark("ark:12345/x6np1wh8k/page2.pdf").unwrap();
-        let clean2 = parse_ark("ark:12345/x6np1wh8k/page2").unwrap();
-        assert_eq!(ark, clean1);
-        assert_eq!(ark2, clean2);
-    }
-
-    #[test]
-    fn test_naan_lowercase_normalization() {
-        // Per RFC 3.2: NAAN should be normalized to lowercase FOR COMPARISON
-        // But we store the original case for resolution
-        let uppercase_naan = parse_ark("ark:ABCDE/x6np1wh8k").unwrap();
-        let lowercase_naan = parse_ark("ark:abcde/x6np1wh8k").unwrap();
-        let mixed_case = parse_ark("ark:AbCdE/x6np1wh8k").unwrap();
-
-        // Equality uses normalized form
-        assert_eq!(uppercase_naan, lowercase_naan);
-        assert_eq!(uppercase_naan, mixed_case);
-
-        // But original case is preserved in fields
-        assert_eq!(uppercase_naan.naan, "ABCDE");
-        assert_eq!(lowercase_naan.naan, "abcde");
-        assert_eq!(mixed_case.naan, "AbCdE");
-    }
-
-    #[test]
-    fn test_combined_normalization() {
-        // Test multiple normalization features together
-        // This simulates an ARK that was copy-pasted from formatted text
-        let messy = parse_ark("ark:/ABCDE/x6-np-1wh8k/page2.pdf/?foo=bar").unwrap();
-        let clean = parse_ark("ark:abcde/x6np1wh8k/page2.pdf").unwrap();
-
-        // They're equal for comparison (normalized)
-        assert_eq!(messy, clean);
-
-        // But messy ARK preserves original components (WITH query string in qualifier)
-        assert_eq!(messy.naan, "ABCDE"); // Original case preserved
-        assert_eq!(messy.shoulder, "x6");
-        assert_eq!(messy.blade, "-np-1wh8k"); // Hyphens preserved
-        assert_eq!(messy.qualifier, "page2.pdf/?foo=bar"); // Trailing slash AND query preserved
-
-        // Clean ARK has normalized components
-        assert_eq!(clean.naan, "abcde");
-        assert_eq!(clean.shoulder, "x6");
-        assert_eq!(clean.blade, "np1wh8k");
-        assert_eq!(clean.qualifier, "page2.pdf");
-    }
-
-    #[test]
-    fn test_whitespace_removal() {
-        // Per RFC 3.1: normalize whitespace from text wrapping/copy-paste
-        let with_spaces = parse_ark("ark:12345/x6np 1wh8k").unwrap();
-        let with_newline = parse_ark("ark:12345/x6np\n1wh8k").unwrap();
-        let with_tab = parse_ark("ark:12345/x6np\t1wh8k").unwrap();
-        let clean = parse_ark("ark:12345/x6np1wh8k").unwrap();
-
-        // All should be equal when normalized
-        assert_eq!(with_spaces, clean);
-        assert_eq!(with_newline, clean);
-        assert_eq!(with_tab, clean);
-
-        // But original components preserve whitespace
-        assert_eq!(with_spaces.blade, "np 1wh8k");
-        assert_eq!(with_newline.blade, "np\n1wh8k");
-        assert_eq!(with_tab.blade, "np\t1wh8k");
-    }
-
-    #[test]
-    fn test_line_wrapped_ark() {
-        // Simulate an ARK that was line-wrapped in an email or document
-        let wrapped = parse_ark("ark:12345/x6np1wh8k/\npage2.pdf").unwrap();
-        let clean = parse_ark("ark:12345/x6np1wh8k/page2.pdf").unwrap();
-
-        assert_eq!(wrapped, clean);
-        assert_eq!(wrapped.qualifier, "\npage2.pdf"); // Original preserves newline
-    }
-
-    #[test]
-    fn test_rfc_example_equivalence() {
-        // Per RFC 3.1, these ARKs should be equivalent FOR COMPARISON:
-        // ark:12345/x5-4-xz-321
-        // https://sneezy.dopey.com/ark:12345/x54--xz32-1
-        // ark:12345/x54xz321
-
-        let ark1 = parse_ark("ark:12345/x5-4-xz-321").unwrap();
-        let ark2 = parse_ark("ark:12345/x54--xz32-1").unwrap();
-        let ark3 = parse_ark("ark:12345/x54xz321").unwrap();
-
-        // All three are equal for comparison
-        assert_eq!(ark1, ark2);
-        assert_eq!(ark2, ark3);
-
-        // But they preserve their original forms
-        assert_eq!(ark1.shoulder, "x5");
-        assert_eq!(ark1.blade, "-4-xz-321"); // Hyphens preserved
-
-        assert_eq!(ark2.shoulder, "x5");
-        assert_eq!(ark2.blade, "4--xz32-1"); // Hyphens preserved
-
-        assert_eq!(ark3.shoulder, "x5");
-        assert_eq!(ark3.blade, "4xz321"); // No hyphens in original
-    }
+fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
 }

@@ -1,99 +1,34 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+
+use serde::Deserialize;
+use serde::de::{Deserializer, MapAccess, Visitor};
 use url::Url;
 
-use crate::ark::Ark;
+use crate::ark::{Ark, is_primordinal_shoulder};
+use crate::error::AppError;
 
-/// Represents a shoulder configuration in the ARK system
+/// A shoulder's resolver configuration.
 ///
-/// # Resolver Rules (N2T.net/ARK Alliance Standard)
+/// `route_pattern` is a URL to which the ARK is appended, or a template whose variables carry
+/// the parts of the ARK as received, with the label as "ark:"; the ARK's query string joins
+/// the target's query. For `ark:12345/x8rd9/page2.pdf`:
 ///
-/// The `route_pattern` provides instructions for constructing a redirect URL for ARK identifiers.
-/// This follows the same format used by N2T.net and other ARK resolvers.
+/// - `${pid}`: `ark:12345/x8rd9/page2.pdf`
+/// - `${scheme}`: `ark`
+/// - `${content}`: `12345/x8rd9/page2.pdf`
+/// - `${prefix}` or `${naan}`: `12345`
+/// - `${value}`: `x8rd9/page2.pdf`
 ///
-/// ## Simple URL
-///
-/// A truncated URL to which the resolver will append the full ARK identifier:
-///
-/// ```json
-/// {
-///   "x6": {
-///     "route_pattern": "https://example.org/",
-///     "project_name": "Simple Redirect"
-///   }
-/// }
-/// ```
-///
-/// For ARK `ark:12345/x6test`, redirects to: `https://example.org/ark:12345/x6test`
-///
-/// ## Template Variables
-///
-/// For more sophisticated routing, use template variables that are replaced with ARK components.
-/// For an ARK "ark:12345/x8rd9/page2.pdf", the available variables are:
-///
-/// - `${pid}` - Full ARK identifier: `ark:12345/x8rd9/page2.pdf`
-/// - `${scheme}` - Scheme: `ark`
-/// - `${content}` - Everything after "ark:": `12345/x8rd9/page2.pdf`
-/// - `${prefix}` - NAAN: `12345`
-/// - `${value}` - Everything after NAAN/: `x8rd9/page2.pdf`
-///
-/// ## Template Examples
-///
-/// ### Using ${value} (recommended for most cases)
-/// ```json
-/// {
-///   "x8": {
-///     "route_pattern": "https://ark.example.org/mycontent/${value}",
-///     "project_name": "Value Template"
-///   }
-/// }
-/// ```
-/// `ark:12345/x8rd9/page.pdf` → `https://ark.example.org/mycontent/x8rd9/page.pdf`
-///
-/// ### Using ${pid} as query parameter
-/// ```json
-/// {
-///   "fk4": {
-///     "route_pattern": "https://resolver.example.org/resolve?id=${pid}",
-///     "project_name": "Query Parameter"
-///   }
-/// }
-/// ```
-/// `ark:12345/fk4test` → `https://resolver.example.org/resolve?id=ark:12345/fk4test`
-///
-/// ### Using ${content} (without ark: prefix)
-/// ```json
-/// {
-///   "b3": {
-///     "route_pattern": "https://api.example.org/objects/${content}",
-///     "project_name": "API Integration"
-///   }
-/// }
-/// ```
-/// `ark:12345/b3data/page.pdf` → `https://api.example.org/objects/12345/b3data/page.pdf`
-///
-/// ### Using ${prefix} and ${value} separately
-/// ```json
-/// {
-///   "z9": {
-///     "route_pattern": "https://storage.example.org/${prefix}/items/${value}",
-///     "project_name": "Separate Components"
-///   }
-/// }
-/// ```
-/// `ark:12345/z9item/file.txt` → `https://storage.example.org/12345/items/z9item/file.txt`
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Each `${var}` may also be written `{var}`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Shoulder {
-    /// The routing pattern/template for this shoulder
     pub route_pattern: String,
-    /// The human-readable project name associated with this shoulder
     pub project_name: String,
-    /// Whether this shoulder uses a check character (default: true)
     #[serde(default = "default_uses_check_character")]
     pub uses_check_character: bool,
-    /// Optional blade length for this shoulder, excluding the check character.
-    /// If not specified, defaults to the global DEFAULT_BLADE_LENGTH.
-    /// When uses_check_character is true, the final blade will be one character longer.
+    /// Blade length without the check character; `None` uses `AppState::default_blade_length`.
     pub blade_length: Option<usize>,
 }
 
@@ -106,343 +41,281 @@ impl Default for Shoulder {
         Self {
             route_pattern: String::new(),
             project_name: String::new(),
-            uses_check_character: true,
+            uses_check_character: default_uses_check_character(),
             blade_length: None,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+enum Part {
+    Pid,
+    Scheme,
+    Content,
+    Prefix,
+    Value,
+}
+
+const VARIABLES: &[(&str, Part)] = &[
+    ("pid", Part::Pid),
+    ("scheme", Part::Scheme),
+    ("content", Part::Content),
+    ("prefix", Part::Prefix),
+    ("naan", Part::Prefix),
+    ("value", Part::Value),
+];
+
+/// Lowercase ASCII, so it survives host normalization and shows up wherever it lands.
+const SENTINEL: &str = "arkplaceholder";
+
 impl Shoulder {
-    /// Validate the route_pattern for security issues
-    ///
-    /// Ensures:
-    /// - Pattern is a valid URL
-    /// - Scheme is http or https only
-    /// - Template variables appear only in path or query components
-    /// - No control characters (CR, LF, null bytes)
+    /// Rejects patterns that are not http(s) URLs, contain control characters, malformed or
+    /// unknown variables or dot segments, or let the ARK reach the scheme, user info, host or
+    /// port.
     pub fn validate_route_pattern(&self) -> Result<(), String> {
-        // Check for control characters
-        if self.route_pattern.chars().any(|c| c.is_control()) {
+        if self.route_pattern.chars().any(char::is_control) {
             return Err("route_pattern contains control characters".to_string());
         }
-
-        // Check if pattern has template variables
-        let has_template_vars = self.route_pattern.contains("${")
-            || self.route_pattern.contains("{pid}")
-            || self.route_pattern.contains("{scheme}")
-            || self.route_pattern.contains("{content}")
-            || self.route_pattern.contains("{prefix}")
-            || self.route_pattern.contains("{value}")
-            || self.route_pattern.contains("{naan}");
-
-        // If no template variables, just validate the base URL
-        if !has_template_vars {
-            return self.validate_base_url(&self.route_pattern);
+        let template = Template::parse(&self.route_pattern)?;
+        let target = template.render(|_| SENTINEL);
+        if has_dot_segment(&target) {
+            return Err("route_pattern contains a '.' or '..' path segment".to_string());
         }
-
-        // For templates, replace variables with safe placeholders to check structure
-        let test_url = self
-            .route_pattern
-            .replace("${pid}", "placeholder")
-            .replace("${scheme}", "placeholder")
-            .replace("${content}", "placeholder")
-            .replace("${prefix}", "placeholder")
-            .replace("${value}", "placeholder")
-            .replace("{pid}", "placeholder")
-            .replace("{scheme}", "placeholder")
-            .replace("{content}", "placeholder")
-            .replace("{prefix}", "placeholder")
-            .replace("{value}", "placeholder")
-            .replace("{naan}", "placeholder");
-
-        self.validate_base_url(&test_url)?;
-
-        // Additional check: ensure template variables don't appear in scheme or host position
-        // Parse the original pattern to find where variables are
-        if let Ok(parsed) = Url::parse(&test_url) {
-            // Check if scheme contains template markers in original
-            let scheme_end = self.route_pattern.find("://").unwrap_or(0);
-            if scheme_end > 0 {
-                let scheme_part = &self.route_pattern[..scheme_end];
-                if scheme_part.contains('$') || scheme_part.contains('{') {
-                    return Err("Template variables not allowed in URL scheme position".to_string());
-                }
+        let url = parse_http_url(&target)?;
+        let authority = [
+            url.username(),
+            url.password().unwrap_or(""),
+            url.host_str().unwrap_or(""),
+        ];
+        if authority.iter().any(|part| part.contains(SENTINEL)) {
+            return Err(if template.appends_ark {
+                "The appended ARK would change the host; end route_pattern with '/' or '='"
+            } else {
+                "Template variables are only allowed in the path, query or fragment"
             }
-
-            // Check if host contains template markers
-            if parsed.host_str().is_some() {
-                // Find the host section in original pattern
-                if let Some(after_scheme) = self.route_pattern.split("://").nth(1) {
-                    // Host is before the first '/' or '?' or end of string
-                    let host_end = after_scheme
-                        .find('/')
-                        .or_else(|| after_scheme.find('?'))
-                        .unwrap_or(after_scheme.len());
-                    let host_part = &after_scheme[..host_end];
-
-                    if host_part.contains('$') || host_part.contains('{') {
-                        return Err(
-                            "Template variables not allowed in URL host position".to_string()
-                        );
-                    }
-                }
-            }
+            .to_string());
         }
-
         Ok(())
     }
 
-    /// Validate a URL string
-    fn validate_base_url(&self, url_str: &str) -> Result<(), String> {
-        let parsed =
-            Url::parse(url_str).map_err(|e| format!("Invalid URL in route_pattern: {}", e))?;
-
-        // Only allow http and https schemes
-        match parsed.scheme() {
-            "http" | "https" => Ok(()),
-            other => Err(format!(
-                "Only http and https schemes allowed, found: {}",
-                other
-            )),
-        }
-    }
-
-    /// Validate a constructed redirect URL
-    fn validate_redirect_url(&self, url_str: &str) -> Result<Url, String> {
-        let parsed =
-            Url::parse(url_str).map_err(|e| format!("Invalid redirect URL constructed: {}", e))?;
-
-        // Only allow http and https schemes
-        match parsed.scheme() {
-            "http" | "https" => Ok(parsed),
-            other => Err(format!(
-                "Redirect URL has invalid scheme (expected http/https): {}",
-                other
-            )),
-        }
-    }
-
-    /// Resolve an ARK identifier using this shoulder's routing pattern
+    /// Builds the redirect target for an ARK of this shoulder.
     ///
-    /// This applies the N2T.net/ARK Alliance template substitution to generate
-    /// the target URL for the given ARK.
-    ///
-    /// # Security
-    ///
-    /// The constructed URL is validated to ensure:
-    /// - It parses as a valid URL
-    /// - It uses http or https scheme only
-    /// - No injection of malicious schemes (javascript:, data:, etc.)
-    ///
-    /// If validation fails, returns the error message as the redirect target
-    /// (which will cause the redirect to fail safely).
-    pub fn resolve(&self, parsed_ark: &Ark) -> String {
-        let target = self.apply_template(parsed_ark);
-
-        // Validate the constructed URL
-        match self.validate_redirect_url(&target) {
-            Ok(validated_url) => {
-                tracing::info!(
-                    shoulder = %parsed_ark.shoulder,
-                    target = %validated_url.as_str(),
-                    "ARK redirect target validated"
-                );
-                validated_url.to_string()
-            }
-            Err(e) => {
-                tracing::error!(
-                    shoulder = %parsed_ark.shoulder,
-                    ark = %parsed_ark.original,
-                    attempted_target = %target,
-                    error = %e,
-                    "SECURITY: Invalid redirect URL blocked"
-                );
-                // Return an error URL that will fail safely
-                format!("about:blank#error={}", urlencoding::encode(&e))
-            }
-        }
-    }
-
-    /// Apply N2T.net/ARK Alliance template substitution
-    ///
-    /// Supported variables (both {var} and ${var} formats):
-    /// - {pid} or ${pid} - Full ARK identifier (e.g., "ark:12345/x8rd9")
-    /// - {scheme} or ${scheme} - Scheme (always "ark")
-    /// - {content} or ${content} - Content without scheme (e.g., "12345/x8rd9")
-    /// - {prefix} or ${prefix} or {naan} - NAAN/prefix (e.g., "12345")
-    /// - {value} or ${value} - Identifier value (e.g., "x8rd9")
-    ///
-    /// If no template variables are present in the route_pattern, the full ARK
-    /// identifier is appended to the base URL (N2T.net standard behavior).
-    fn apply_template(&self, parsed_ark: &Ark) -> String {
-        let pid = &parsed_ark.original;
-        let scheme = "ark";
-        let content = if parsed_ark.qualifier.is_empty() {
-            format!(
-                "{}/{}{}",
-                parsed_ark.naan, parsed_ark.shoulder, parsed_ark.blade
-            )
-        } else {
-            format!(
-                "{}/{}{}/{}",
-                parsed_ark.naan, parsed_ark.shoulder, parsed_ark.blade, parsed_ark.qualifier
-            )
-        };
-        let prefix = &parsed_ark.naan;
-        let value = if parsed_ark.qualifier.is_empty() {
-            format!("{}{}", parsed_ark.shoulder, parsed_ark.blade)
-        } else if parsed_ark.qualifier.starts_with('?') {
-            // Query string without path qualifier - no slash needed
-            format!(
-                "{}{}{}",
-                parsed_ark.shoulder, parsed_ark.blade, parsed_ark.qualifier
-            )
-        } else {
-            // Path qualifier - include slash
-            format!(
-                "{}{}/{}",
-                parsed_ark.shoulder, parsed_ark.blade, parsed_ark.qualifier
-            )
+    /// The ARK's query string joins the target's query, so a pattern with text after a
+    /// variable keeps that text in place.
+    pub fn resolve(&self, ark: &Ark) -> Result<String, AppError> {
+        let invalid_target = |e: String| {
+            tracing::error!(ark = ?ark.received(), error = %e, "Invalid redirect target");
+            AppError::InvalidTarget
         };
 
-        // Check if route_pattern contains any template variables
-        let has_template_vars = self.route_pattern.contains("${")
-            || self.route_pattern.contains("{pid}")
-            || self.route_pattern.contains("{scheme}")
-            || self.route_pattern.contains("{content}")
-            || self.route_pattern.contains("{prefix}")
-            || self.route_pattern.contains("{value}")
-            || self.route_pattern.contains("{naan}");
-
-        // If no template variables, append the full ARK (N2T.net standard behavior)
-        if !has_template_vars {
-            return format!("{}{}", self.route_pattern, pid);
+        let template = Template::parse(&self.route_pattern).map_err(invalid_target)?;
+        let target = template.render(|part| match part {
+            Part::Pid => ark.pid(),
+            Part::Scheme => "ark",
+            Part::Content => ark.content(),
+            Part::Prefix => ark.prefix(),
+            Part::Value => ark.value(),
+        });
+        if has_dot_segment(&target) {
+            return Err(AppError::InvalidArk);
         }
 
-        // Normalize template: convert ${var} to {var} format, and also support {naan}
-        let normalized = self
-            .route_pattern
-            .replace("${pid}", "{pid}")
-            .replace("${scheme}", "{scheme}")
-            .replace("${content}", "{content}")
-            .replace("${prefix}", "{prefix}")
-            .replace("${value}", "{value}")
-            .replace("{naan}", "{prefix}");
-
-        // Apply substitutions using rust-style {} format
-        normalized
-            .replace("{pid}", pid)
-            .replace("{scheme}", scheme)
-            .replace("{content}", &content)
-            .replace("{prefix}", prefix)
-            .replace("{value}", &value)
+        let mut url = parse_http_url(&target).map_err(invalid_target)?;
+        if let Some(ark_query) = ark.query() {
+            let query = match url.query() {
+                Some(own) if !own.is_empty() && !ark_query.is_empty() => {
+                    format!("{own}&{ark_query}")
+                }
+                Some(own) if !own.is_empty() => own.to_string(),
+                _ => ark_query.to_string(),
+            };
+            url.set_query(Some(&query));
+        }
+        Ok(url.into())
     }
 }
 
-/// Load shoulders configuration from environment variable
-///
-/// Supports two formats:
-/// 1. JSON format:
-///    ```json
-///    {
-///      "x6": {
-///        "route_pattern": "https://alpha.tm.org/${value}",
-///        "project_name": "Project Alpha",
-///        "uses_check_character": true
-///      }
-///    }
-///    ```
-///
-/// 2. Simple format:
-///    `shoulder\troute\tproject,shoulder\troute\tproject,...`
-///    Example: `x6\thttps://alpha.tm.org/${value}\tProject Alpha,b3\thttps://beta.tm.org/${value}\tProject Beta`
-///
-/// Template variables supported: ${pid}, ${scheme}, ${content}, ${prefix}, ${value}
-///
-/// # Security
-///
-/// All route_patterns are validated on load to ensure:
-/// - Valid URL structure
-/// - Only http/https schemes
-/// - Template variables only in path/query positions
-/// - No control characters
-pub fn load_shoulders_from_env() -> Result<HashMap<String, Shoulder>, String> {
-    let shoulders_config =
-        std::env::var("SHOULDERS").map_err(|_| "SHOULDERS environment variable not set")?;
+enum Segment<'a> {
+    Literal(&'a str),
+    Variable(Part),
+}
 
-    // Try parsing as JSON first
-    let shoulders = if let Ok(s) = parse_shoulders_json(&shoulders_config) {
-        s
-    } else {
-        // Fall back to simple format
-        parse_shoulders_simple(&shoulders_config)?
-    };
+/// A route pattern split into literal text and variables.
+struct Template<'a> {
+    segments: Vec<Segment<'a>>,
+    appends_ark: bool,
+}
 
-    // Validate all route patterns
-    for (name, shoulder) in &shoulders {
-        shoulder
-            .validate_route_pattern()
-            .map_err(|e| format!("Security validation failed for shoulder '{}': {}", name, e))?;
+impl<'a> Template<'a> {
+    /// Every '{' and '}' must belong to a known variable; a pattern without variables gets
+    /// the ARK appended.
+    fn parse(pattern: &'a str) -> Result<Self, String> {
+        let mut segments = Vec::new();
+        let mut rest = pattern;
+        while let Some(open) = rest.find(['{', '}']) {
+            if rest.as_bytes()[open] == b'}' {
+                return Err("route_pattern has a '}' without '{'".to_string());
+            }
+            let after = &rest[open + 1..];
+            let close = after
+                .find('}')
+                .ok_or_else(|| "route_pattern has a '{' without '}'".to_string())?;
+            let name = &after[..close];
+            let &(_, part) = VARIABLES
+                .iter()
+                .find(|(known, _)| *known == name)
+                .ok_or_else(|| format!("Unknown template variable {{{name}}}"))?;
+            let literal = &rest[..open];
+            segments.push(Segment::Literal(
+                literal.strip_suffix('$').unwrap_or(literal),
+            ));
+            segments.push(Segment::Variable(part));
+            rest = &after[close + 1..];
+        }
+        segments.push(Segment::Literal(rest));
+
+        let appends_ark = !segments.iter().any(|s| matches!(s, Segment::Variable(_)));
+        if appends_ark {
+            segments.push(Segment::Variable(Part::Pid));
+        }
+        Ok(Self {
+            segments,
+            appends_ark,
+        })
     }
 
+    /// Values in the query or fragment have `&`, `=`, `+` and `#` percent-encoded, so the
+    /// parts of the ARK cannot add parameters.
+    fn render<'v>(&self, value: impl Fn(Part) -> &'v str) -> String {
+        let mut target = String::new();
+        let mut in_query = false;
+        for segment in &self.segments {
+            match segment {
+                Segment::Literal(literal) => {
+                    in_query |= literal.contains(['?', '#']);
+                    target.push_str(literal);
+                }
+                Segment::Variable(part) if in_query => {
+                    for c in value(*part).chars() {
+                        match c {
+                            '&' => target.push_str("%26"),
+                            '=' => target.push_str("%3D"),
+                            '+' => target.push_str("%2B"),
+                            '#' => target.push_str("%23"),
+                            c => target.push(c),
+                        }
+                    }
+                }
+                Segment::Variable(part) => target.push_str(value(*part)),
+            }
+        }
+        target
+    }
+}
+
+/// Whether the URL's path has a "." or ".." segment, which URL serialization or the target
+/// would resolve away; encoded dots and separators count.
+fn has_dot_segment(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.to_ascii_lowercase()
+        .replace("%2e", ".")
+        .replace("%2f", "/")
+        .replace("%5c", "\\")
+        .split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
+}
+
+fn parse_http_url(url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(url).map_err(|e| format!("Invalid URL {url:?}: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        other => Err(format!(
+            "Only http and https URLs are allowed, found {other:?}"
+        )),
+    }
+}
+
+/// Parses `SHOULDERS`: a JSON object of shoulders, or comma-separated
+/// `shoulder\troute_pattern\tproject_name` entries.
+pub fn parse_shoulders(config: &str) -> Result<HashMap<String, Shoulder>, String> {
+    let entries = if config.trim_start().starts_with('{') {
+        serde_json::from_str::<JsonEntries>(config)
+            .map_err(|e| format!("Invalid SHOULDERS JSON: {e}"))?
+            .0
+    } else {
+        parse_shoulders_simple(config)?
+    };
+    if entries.is_empty() {
+        return Err("SHOULDERS defines no shoulders".to_string());
+    }
+
+    let mut shoulders = HashMap::new();
+    for (name, shoulder) in entries {
+        if !is_primordinal_shoulder(&name) {
+            return Err(format!(
+                "Shoulder {name:?} is not a primordinal shoulder: betanumeric consonants, if any, then one digit"
+            ));
+        }
+        if shoulder.blade_length == Some(0) {
+            return Err(format!(
+                "Shoulder {name:?}: blade_length must be at least 1"
+            ));
+        }
+        shoulder
+            .validate_route_pattern()
+            .map_err(|e| format!("Shoulder {name:?}: {e}"))?;
+        if shoulders.insert(name.clone(), shoulder).is_some() {
+            return Err(format!("Shoulder {name:?} is defined twice"));
+        }
+    }
     Ok(shoulders)
 }
 
-/// Parse shoulders from JSON format
-///
-/// Expects a JSON object with shoulder names as keys and Shoulder objects as values:
-/// ```json
-/// {
-///   "x6": {
-///     "route_pattern": "https://alpha.tm.org/${value}",
-///     "project_name": "Project Alpha",
-///     "uses_check_character": true
-///   }
-/// }
-/// ```
-fn parse_shoulders_json(json_str: &str) -> Result<HashMap<String, Shoulder>, String> {
-    serde_json::from_str::<HashMap<String, Shoulder>>(json_str)
-        .map_err(|e| format!("Failed to parse JSON: {}", e))
-}
+/// The entries of a JSON object in order, duplicates included.
+struct JsonEntries(Vec<(String, Shoulder)>);
 
-/// Parse shoulders from simple tab-delimited format
-///
-/// Format: `shoulder\troute\tproject,shoulder\troute\tproject,...`
-/// Example: `x6\thttps://alpha.tm.org/${value}\tProject Alpha,b3\thttps://beta.tm.org/${value}\tProject Beta`
-///
-/// Supports both literal tab characters and escaped \t sequences.
-///
-/// Returns an error if no valid shoulders are found.
-fn parse_shoulders_simple(simple_str: &str) -> Result<HashMap<String, Shoulder>, String> {
-    let mut shoulders = HashMap::new();
+impl<'de> Deserialize<'de> for JsonEntries {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntriesVisitor;
 
-    // Replace escaped \t with actual tab characters
-    let normalized = simple_str.replace("\\t", "\t");
+        impl<'de> Visitor<'de> for EntriesVisitor {
+            type Value = JsonEntries;
 
-    for entry in normalized.split(',') {
-        let parts: Vec<&str> = entry.split('\t').collect();
-        if parts.len() != 3 {
-            continue;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object of shoulders")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<JsonEntries, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(JsonEntries(entries))
+            }
         }
 
-        let shoulder = parts[0].trim().to_string();
-        let route_pattern = parts[1].trim().to_string();
-        let project_name = parts[2].trim().to_string();
-
-        shoulders.insert(
-            shoulder,
-            Shoulder {
-                route_pattern,
-                project_name,
-                ..Default::default()
-            },
-        );
+        deserializer.deserialize_map(EntriesVisitor)
     }
+}
 
-    if shoulders.is_empty() {
-        return Err("No valid shoulders found in SHOULDERS configuration".to_string());
+fn parse_shoulders_simple(config: &str) -> Result<Vec<(String, Shoulder)>, String> {
+    // Docker Compose YAML passes "\t" as two characters
+    let config = config.replace("\\t", "\t");
+    let mut shoulders = Vec::new();
+    for entry in config.split(',') {
+        let fields: Vec<&str> = entry.split('\t').map(str::trim).collect();
+        let [name, route_pattern, project_name] = fields[..] else {
+            return Err(format!(
+                "SHOULDERS entry {entry:?} needs three tab-separated fields"
+            ));
+        };
+        let shoulder = Shoulder {
+            route_pattern: route_pattern.to_string(),
+            project_name: project_name.to_string(),
+            ..Default::default()
+        };
+        shoulders.push((name.to_string(), shoulder));
     }
-
     Ok(shoulders)
 }
 
@@ -451,519 +324,242 @@ mod tests {
     use super::*;
     use crate::ark::parse_ark;
 
-    // Security validation tests
+    fn shoulder(route_pattern: &str) -> Shoulder {
+        Shoulder {
+            route_pattern: route_pattern.to_string(),
+            project_name: "Test".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn resolve(route_pattern: &str, ark: &str) -> Result<String, AppError> {
+        shoulder(route_pattern).resolve(&parse_ark(ark).unwrap())
+    }
 
     #[test]
-    fn test_validate_route_pattern_valid_urls() {
-        let valid_patterns = vec![
+    fn accepts_patterns_with_variables_in_path_query_or_fragment() {
+        for pattern in [
             "https://example.org/",
-            "http://example.org/items",
-            "https://example.org/${value}",
-            "https://api.example.org/resolve?id=${pid}",
-            "https://example.org/path/${value}/more",
-        ];
-
-        for pattern in valid_patterns {
-            let shoulder = Shoulder {
-                route_pattern: pattern.to_string(),
-                project_name: "Test".to_string(),
-                ..Default::default()
-            };
+            "https://example.org/resolve?id=",
+            "http://example.org:8080/items/${value}",
+            "https://example.org/resolve?id={pid}",
+            "https://example.org/${prefix}/${scheme}/{naan}/${content}",
+            "https://example.org/page#${value}",
+        ] {
             assert!(
-                shoulder.validate_route_pattern().is_ok(),
-                "Should accept valid pattern: {}",
-                pattern
+                shoulder(pattern).validate_route_pattern().is_ok(),
+                "{pattern}"
             );
         }
     }
 
     #[test]
-    fn test_validate_route_pattern_invalid_schemes() {
-        let invalid_schemes = vec![
-            "javascript:alert(1)",
-            "data:text/html,<script>alert(1)</script>",
-            "file:///etc/passwd",
-            "ftp://example.org/",
-        ];
-
-        for pattern in invalid_schemes {
-            let shoulder = Shoulder {
-                route_pattern: pattern.to_string(),
-                project_name: "Test".to_string(),
-                ..Default::default()
-            };
-            assert!(
-                shoulder.validate_route_pattern().is_err(),
-                "Should reject invalid scheme: {}",
-                pattern
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_route_pattern_template_in_scheme() {
-        let patterns = vec![
-            "${scheme}://example.org/",
-            "{scheme}://example.org/",
-            "ht${value}://example.org/",
-        ];
-
-        for pattern in patterns {
-            let shoulder = Shoulder {
-                route_pattern: pattern.to_string(),
-                project_name: "Test".to_string(),
-                ..Default::default()
-            };
-            assert!(
-                shoulder.validate_route_pattern().is_err(),
-                "Should reject template in scheme: {}",
-                pattern
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_route_pattern_template_in_host() {
-        let patterns = vec![
+    fn rejects_patterns_that_let_the_ark_reach_the_authority() {
+        for pattern in [
+            "https:${value}",
+            "https:/${value}",
             "https://${value}.example.org/",
-            "https://evil${pid}.com/",
-            "https://example.${content}/",
-        ];
-
-        for pattern in patterns {
-            let shoulder = Shoulder {
-                route_pattern: pattern.to_string(),
-                project_name: "Test".to_string(),
-                ..Default::default()
-            };
+            "https://{value}@example.org/",
+            "https://example.org:{value}/",
+            "https://example.org{value}",
+            "${scheme}://example.org/",
+            "https://example.org",
+            "https://example.org:8080",
+        ] {
             assert!(
-                shoulder.validate_route_pattern().is_err(),
-                "Should reject template in host: {}",
-                pattern
+                shoulder(pattern).validate_route_pattern().is_err(),
+                "{pattern}"
             );
         }
     }
 
     #[test]
-    fn test_validate_route_pattern_control_characters() {
-        let patterns = vec![
-            "https://example.org/\r\n",
-            "https://example.org/\x00",
-            "https://example.org/\t",
-        ];
-
-        for pattern in &patterns {
-            let shoulder = Shoulder {
-                route_pattern: pattern.to_string(),
-                project_name: "Test".to_string(),
-                ..Default::default()
-            };
+    fn rejects_invalid_patterns() {
+        for pattern in [
+            "javascript:alert(1)",
+            "ftp://example.org/",
+            "not a url",
+            "https://example.org/\n",
+            "https://example.org/${PID}",
+            "https://example.org/{unknown}",
+            "https://example.org/{value",
+            "https://example.org/${ value}",
+            "https://example.org/}/${value}",
+            "https://example.org/a/../${value}",
+        ] {
             assert!(
-                shoulder.validate_route_pattern().is_err(),
-                "Should reject control characters"
+                shoulder(pattern).validate_route_pattern().is_err(),
+                "{pattern}"
             );
         }
     }
 
     #[test]
-    fn test_validate_route_pattern_malformed_urls() {
-        let patterns = vec!["not-a-url", "://missing-scheme", "https://", ""];
+    fn substitutes_every_variable() {
+        assert_eq!(
+            resolve(
+                "https://example.org/${pid}/${scheme}/${content}/${prefix}/{naan}/${value}",
+                "ark:12345/x6np1wh8k/page2.pdf"
+            ),
+            Ok("https://example.org/ark:12345/x6np1wh8k/page2.pdf/ark/12345/x6np1wh8k/page2.pdf/12345/12345/x6np1wh8k/page2.pdf".to_string())
+        );
+    }
 
-        for pattern in patterns {
-            let shoulder = Shoulder {
-                route_pattern: pattern.to_string(),
-                project_name: "Test".to_string(),
-                ..Default::default()
-            };
-            assert!(
-                shoulder.validate_route_pattern().is_err(),
-                "Should reject malformed URL: {}",
-                pattern
+    #[test]
+    fn appends_the_ark_to_a_pattern_without_variables() {
+        assert_eq!(
+            resolve("https://example.org/", "ark:12345/x6np1wh8k?info"),
+            Ok("https://example.org/ark:12345/x6np1wh8k?info".to_string())
+        );
+    }
+
+    #[test]
+    fn encodes_query_delimiters_in_query_values() {
+        assert_eq!(
+            resolve(
+                "https://example.org/resolve?id={pid}",
+                "ark:12345/x6a&admin=1"
+            ),
+            Ok("https://example.org/resolve?id=ark:12345/x6a%26admin%3D1".to_string())
+        );
+        assert_eq!(
+            resolve("https://example.org/${value}", "ark:12345/x6a&b=1"),
+            Ok("https://example.org/x6a&b=1".to_string())
+        );
+    }
+
+    #[test]
+    fn encodes_query_delimiters_in_appended_arks() {
+        assert_eq!(
+            resolve("https://example.org/resolve?id=", "ark:12345/x6a&admin=1"),
+            Ok("https://example.org/resolve?id=ark:12345/x6a%26admin%3D1".to_string())
+        );
+    }
+
+    #[test]
+    fn merges_the_ark_query_into_the_target_query() {
+        for (pattern, ark, target) in [
+            (
+                "https://example.org/${value}/manifest",
+                "ark:12345/x6a?info",
+                "https://example.org/x6a/manifest?info",
+            ),
+            (
+                "https://example.org/${value}?format=json",
+                "ark:12345/x6a?info",
+                "https://example.org/x6a?format=json&info",
+            ),
+            (
+                "https://example.org/resolve?id=${pid}",
+                "ark:12345/x6a?info",
+                "https://example.org/resolve?id=ark:12345/x6a&info",
+            ),
+            (
+                "https://example.org/",
+                "ark:12345/x6a??",
+                "https://example.org/ark:12345/x6a??",
+            ),
+            (
+                "https://example.org/",
+                "ark:12345/x6a?",
+                "https://example.org/ark:12345/x6a?",
+            ),
+        ] {
+            assert_eq!(
+                resolve(pattern, ark),
+                Ok(target.to_string()),
+                "{pattern} {ark}"
             );
         }
     }
 
     #[test]
-    fn test_resolve_blocks_malicious_ark_components() {
-        // Test that even if ARK components contain malicious content,
-        // the final URL validation catches it
-        let shoulder = Shoulder {
-            route_pattern: "https://example.org/${value}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-
-        // Create ARK with various injection attempts
-        let test_cases = vec![
-            ("ark:12345/x6test", "https://example.org/x6test"),
-            // Normal case - should work
-        ];
-
-        for (ark_str, expected) in test_cases {
-            if let Some(parsed) = parse_ark(ark_str) {
-                let result = shoulder.resolve(&parsed);
-                // If it's a valid redirect, check it matches expected
-                // If it's blocked, it will be about:blank#error=...
-                if !result.starts_with("about:blank") {
-                    assert_eq!(result, expected);
-                }
-            }
+    fn rejects_targets_with_dot_segments() {
+        for (pattern, ark) in [
+            ("https://example.org/${value}", "ark:12345/x6a/../admin"),
+            ("https://example.org/${value}", "ark:12345/x6a%2F..%2Fadmin"),
+            ("https://example.org/a/${value}../secret", "ark:12345/x6a/"),
+        ] {
+            assert_eq!(
+                resolve(pattern, ark),
+                Err(AppError::InvalidArk),
+                "{pattern} {ark}"
+            );
         }
+        assert!(
+            resolve(
+                "https://example.org/resolve?id=${pid}",
+                "ark:12345/x6a/../b"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn test_resolve_validates_final_url() {
-        // Test URL validation of the final constructed redirect
-        let shoulder = Shoulder {
-            route_pattern: "https://example.org/${value}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-
-        let ark = parse_ark("ark:12345/x6test").unwrap();
-        let result = shoulder.resolve(&ark);
-
-        // Should be a valid URL
-        assert!(Url::parse(&result).is_ok());
-
-        // Should be https
-        let parsed = Url::parse(&result).unwrap();
-        assert!(parsed.scheme() == "https" || result.starts_with("about:blank"));
+    fn reports_a_target_that_is_not_a_url() {
+        assert_eq!(
+            resolve("https://example.org:{value}/", "ark:12345/x6a"),
+            Err(AppError::InvalidTarget)
+        );
     }
 
     #[test]
-    fn test_load_shoulders_validates_patterns() {
-        // Test that loading shoulders validates all patterns
-        unsafe {
-            std::env::set_var(
-                "SHOULDERS",
-                r#"{
-                "x6": {
-                    "route_pattern": "javascript:alert(1)",
-                    "project_name": "Evil"
-                }
+    fn parses_json_shoulders() {
+        let shoulders = parse_shoulders(
+            r#"{
+                "x6": {"route_pattern": "https://alpha.org/${value}", "project_name": "Alpha", "uses_check_character": false, "blade_length": 12},
+                "b3": {"route_pattern": "https://beta.org/{value}", "project_name": "Beta"}
             }"#,
-            );
+        )
+        .unwrap();
+
+        assert!(!shoulders["x6"].uses_check_character);
+        assert_eq!(shoulders["x6"].blade_length, Some(12));
+        assert!(shoulders["b3"].uses_check_character);
+        assert_eq!(shoulders["b3"].blade_length, None);
+    }
+
+    #[test]
+    fn parses_simple_shoulders_with_escaped_tabs() {
+        let shoulders = parse_shoulders(
+            r"b1\thttps://ark.timeatlas.eu/{pid}\tTime Atlas, x6	https://example.org/	Project X",
+        )
+        .unwrap();
+
+        assert_eq!(
+            shoulders["b1"].route_pattern,
+            "https://ark.timeatlas.eu/{pid}"
+        );
+        assert_eq!(shoulders["b1"].project_name, "Time Atlas");
+        assert!(shoulders["b1"].uses_check_character);
+        assert_eq!(shoulders["x6"].project_name, "Project X");
+    }
+
+    #[test]
+    fn rejects_invalid_shoulder_configurations() {
+        for config in [
+            "",
+            "{}",
+            r#"{"x6": {"route_pattern": "https://e.org/", "project_name": "X",}}"#,
+            r#"{"x6": {"route_pattern": "https://e.org/"}}"#,
+            r#"{"x6": {"route_pattern": "https://e.org/", "project_name": "X", "uses_check_charcter": false}}"#,
+            r#"{"x6": {"route_pattern": "https://e.org/", "project_name": "X", "blade_length": 0}}"#,
+            r#"{"x6": {"route_pattern": "https://a.org/", "project_name": "A"}, "x6": {"route_pattern": "https://b.org/", "project_name": "B"}}"#,
+            r#"{"x6": {"route_pattern": "javascript:alert(1)", "project_name": "X"}}"#,
+            "x6\thttps://e.org/",
+            "x6\thttps://e.org/\tA,x6\thttps://e.org/\tB",
+            "x6\thttps://e.org/a,b/\tA",
+        ] {
+            assert!(parse_shoulders(config).is_err(), "{config}");
         }
+    }
 
-        let result = load_shoulders_from_env();
-        assert!(result.is_err(), "Should reject invalid scheme on load");
-        assert!(result.unwrap_err().contains("Security validation failed"));
-
-        // Clean up
-        unsafe {
-            std::env::remove_var("SHOULDERS");
+    #[test]
+    fn rejects_shoulders_that_are_not_primordinal() {
+        for name in ["B1", "ab1", "b12", "b", "x6x"] {
+            let config = format!("{name}\thttps://e.org/\tTest");
+            assert!(parse_shoulders(&config).is_err(), "{name}");
         }
-    }
-
-    #[test]
-    fn test_load_shoulders_rejects_template_in_host() {
-        unsafe {
-            std::env::set_var(
-                "SHOULDERS",
-                r#"{
-                "x6": {
-                    "route_pattern": "https://${value}.evil.com/",
-                    "project_name": "Evil"
-                }
-            }"#,
-            );
-        }
-
-        let result = load_shoulders_from_env();
-        assert!(result.is_err(), "Should reject template in host on load");
-
-        // Clean up
-        unsafe {
-            std::env::remove_var("SHOULDERS");
-        }
-    }
-
-    #[test]
-    fn test_parse_shoulders_json() {
-        // Valid JSON with multiple shoulders and check_character variations
-        let json = r#"
-        {
-            "x6": {
-                "route_pattern": "https://alpha.tm.org/${value}",
-                "project_name": "Project Alpha",
-                "uses_check_character": false
-            },
-            "b3": {
-                "route_pattern": "https://beta.tm.org/{value}",
-                "project_name": "Project Beta"
-            }
-        }
-        "#;
-
-        let shoulders = parse_shoulders_json(json).unwrap();
-        assert_eq!(shoulders.len(), 2);
-
-        let x6 = &shoulders["x6"];
-        assert_eq!(x6.route_pattern, "https://alpha.tm.org/${value}");
-        assert!(!x6.uses_check_character);
-
-        let b3 = &shoulders["b3"];
-        assert!(b3.uses_check_character); // Default value
-
-        // Invalid JSON
-        assert!(parse_shoulders_json(r#"{ "x6": "invalid" }"#).is_err());
-        assert!(parse_shoulders_json(r#"{ "x6": { "route"#).is_err());
-    }
-
-    #[test]
-    fn test_parse_shoulders_with_blade_length() {
-        // Test parsing JSON with blade_length field
-        let json = r#"
-        {
-            "x6": {
-                "route_pattern": "https://alpha.tm.org/${value}",
-                "project_name": "Custom Length",
-                "uses_check_character": true,
-                "blade_length": 12
-            },
-            "b3": {
-                "route_pattern": "https://beta.tm.org/${value}",
-                "project_name": "Default Length",
-                "uses_check_character": false
-            }
-        }
-        "#;
-
-        let shoulders = parse_shoulders_json(json).unwrap();
-        assert_eq!(shoulders.len(), 2);
-
-        let x6 = &shoulders["x6"];
-        assert_eq!(x6.blade_length, Some(12));
-
-        let b3 = &shoulders["b3"];
-        assert_eq!(b3.blade_length, None); // Not specified, should be None
-    }
-
-    #[test]
-    fn test_parse_shoulders_simple() {
-        // Valid: single and multiple shoulders with complex URLs and special chars in names
-        let simple = "x6\thttps://alpha.tm.org:8080/${value}\tProject Alpha,b3\thttp://beta.tm.org\tProject: Beta";
-        let shoulders = parse_shoulders_simple(simple).unwrap();
-
-        assert_eq!(shoulders.len(), 2);
-
-        let x6 = &shoulders["x6"];
-        assert_eq!(x6.route_pattern, "https://alpha.tm.org:8080/${value}");
-        assert_eq!(x6.project_name, "Project Alpha");
-        assert!(x6.uses_check_character);
-        assert_eq!(x6.blade_length, None);
-
-        let b3 = &shoulders["b3"];
-        assert_eq!(b3.route_pattern, "http://beta.tm.org");
-        assert_eq!(b3.project_name, "Project: Beta");
-
-        // Skip invalid entries (wrong number of parts)
-        let mixed = "invalid,x6\thttps://example.org\tTest";
-        assert_eq!(parse_shoulders_simple(mixed).unwrap().len(), 1);
-
-        // Error on all invalid
-        assert!(parse_shoulders_simple("").is_err());
-        assert!(parse_shoulders_simple("invalid").is_err());
-        assert!(parse_shoulders_simple("x6\tonly_two").is_err());
-        assert!(parse_shoulders_simple("x6\ttoo\tmany\tparts").is_err());
-    }
-
-    #[test]
-    fn test_parse_shoulders_simple_escaped_tabs() {
-        // Test parsing with escaped \t sequences (as they appear in Docker Compose YAML)
-        let escaped = r"b1\thttps://ark.timeatlas.eu/${pid}\tTime Atlas";
-        let shoulders = parse_shoulders_simple(escaped).unwrap();
-
-        assert_eq!(shoulders.len(), 1);
-
-        let b1 = &shoulders["b1"];
-        assert_eq!(b1.route_pattern, "https://ark.timeatlas.eu/${pid}");
-        assert_eq!(b1.project_name, "Time Atlas");
-        assert!(b1.uses_check_character);
-
-        // Test with multiple shoulders using escaped tabs
-        let multiple_escaped =
-            r"x6\thttps://example.org/${value}\tProject X,b3\thttps://test.org/${pid}\tProject B";
-        let shoulders = parse_shoulders_simple(multiple_escaped).unwrap();
-        assert_eq!(shoulders.len(), 2);
-    }
-
-    // Template resolution tests
-
-    #[test]
-    fn test_resolve_all_placeholders() {
-        let ark = "ark:12345/x6np1wh8k/page2.pdf";
-        let parsed = parse_ark(ark).unwrap();
-
-        // Test all ARK Alliance standard variables in realistic URL contexts
-        let shoulder_pid = Shoulder {
-            route_pattern: "https://example.org/resolve?id=${pid}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder_pid.resolve(&parsed),
-            "https://example.org/resolve?id=ark:12345/x6np1wh8k/page2.pdf"
-        );
-
-        let shoulder_content = Shoulder {
-            route_pattern: "https://example.org/${content}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder_content.resolve(&parsed),
-            "https://example.org/12345/x6np1wh8k/page2.pdf"
-        );
-
-        let shoulder_prefix = Shoulder {
-            route_pattern: "https://example.org/${prefix}/items".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder_prefix.resolve(&parsed),
-            "https://example.org/12345/items"
-        );
-
-        let shoulder_value = Shoulder {
-            route_pattern: "https://example.org/objects/${value}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder_value.resolve(&parsed),
-            "https://example.org/objects/x6np1wh8k/page2.pdf"
-        );
-
-        // Test complex template with multiple variables
-        let shoulder_complex = Shoulder {
-            route_pattern: "https://example.org/view?ark=${pid}&naan=${prefix}&id=${value}"
-                .to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        let expected = "https://example.org/view?ark=ark:12345/x6np1wh8k/page2.pdf&naan=12345&id=x6np1wh8k/page2.pdf";
-        assert_eq!(shoulder_complex.resolve(&parsed), expected);
-    }
-
-    #[test]
-    fn test_resolve_without_qualifier() {
-        let ark = "ark:12345/x6np1wh8k";
-        let parsed = parse_ark(ark).unwrap();
-
-        // Test standard template with value
-        let shoulder = Shoulder {
-            route_pattern: "https://example.org/items/${value}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder.resolve(&parsed),
-            "https://example.org/items/x6np1wh8k"
-        );
-    }
-
-    #[test]
-    fn test_resolve_with_query_string() {
-        // Test that query strings are forwarded with template variables
-        let ark = "ark:12345/x6np1wh8k?info";
-        let parsed = parse_ark(ark).unwrap();
-
-        // Test with ${value} template
-        let shoulder = Shoulder {
-            route_pattern: "https://example.org/items/${value}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder.resolve(&parsed),
-            "https://example.org/items/x6np1wh8k?info"
-        );
-
-        // Test with ${pid} template
-        let shoulder2 = Shoulder {
-            route_pattern: "https://example.org/resolve?id=${pid}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder2.resolve(&parsed),
-            "https://example.org/resolve?id=ark:12345/x6np1wh8k?info"
-        );
-
-        // Test with no template variables
-        let shoulder3 = Shoulder {
-            route_pattern: "https://example.org/".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder3.resolve(&parsed),
-            "https://example.org/ark:12345/x6np1wh8k?info"
-        );
-    }
-
-    #[test]
-    fn test_resolve_real_world_examples() {
-        let ark = "ark:99999/fk4test123/metadata.xml";
-        let parsed = parse_ark(ark).unwrap();
-
-        // Example 1: Simple redirect - N2T.net will append the full ARK to base URL
-        // (No template variables needed for this case)
-        let shoulder1 = Shoulder {
-            route_pattern: "https://example.org/".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder1.resolve(&parsed),
-            "https://example.org/ark:99999/fk4test123/metadata.xml"
-        );
-
-        // Example 2: ARK Alliance standard - use ${value} variable (most common)
-        let shoulder2 = Shoulder {
-            route_pattern: "https://ark.example.org/mycontent/${value}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder2.resolve(&parsed),
-            "https://ark.example.org/mycontent/fk4test123/metadata.xml"
-        );
-
-        // Example 3: Use ${pid} to pass full ARK as query parameter
-        let shoulder3 = Shoulder {
-            route_pattern: "https://resolver.example.org/resolve?id=${pid}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder3.resolve(&parsed),
-            "https://resolver.example.org/resolve?id=ark:99999/fk4test123/metadata.xml"
-        );
-
-        // Example 4: Use ${content} (without ark: prefix)
-        let shoulder4 = Shoulder {
-            route_pattern: "https://api.example.org/v1/objects/${content}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder4.resolve(&parsed),
-            "https://api.example.org/v1/objects/99999/fk4test123/metadata.xml"
-        );
-
-        // Example 5: Use ${prefix} and ${value} separately
-        let shoulder5 = Shoulder {
-            route_pattern: "https://storage.example.org/${prefix}/items/${value}".to_string(),
-            project_name: "Test".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            shoulder5.resolve(&parsed),
-            "https://storage.example.org/99999/items/fk4test123/metadata.xml"
-        );
+        assert!(parse_shoulders("bcd7\thttps://e.org/\tTest").is_ok());
     }
 }

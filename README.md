@@ -1,8 +1,6 @@
 # ARK Service
 
-A stateless service that mints, validates and resolves ARKs (Archival Resource Keys).
-
-ARK Service mints random ARKs with optional NCDA check characters, validates ARKs against the ARK specification, and redirects ARKs to per-shoulder targets. It keeps no database: the system that assigns an ARK to a resource stores that mapping. The service is written in Rust with Axum and ships as a Docker image on the GitHub Container Registry.
+ARK Service mints random ARKs (Archival Resource Keys) with optional NCDA check characters, validates ARKs against the ARK specification, and redirects ARKs to per-shoulder targets. The service is written in Rust with Axum and ships as a Docker image on the GitHub Container Registry.
 
 ## ARK primer
 
@@ -63,13 +61,13 @@ References: [ARK specification (draft-kunze-ark-43)](https://www.ietf.org/archiv
 
 The service implements [draft-kunze-ark-43](https://www.ietf.org/archive/id/draft-kunze-ark-43.html). Normalization follows the eight steps of §3.2 in order, and matching and validation use the normalized components. The service also applies the optional cleanup of §3.1 to the characters it receives: it removes whitespace and treats U+2010 to U+2015 as hyphens. In a request path these characters arrive percent-encoded, and percent-encoded octets are ARK characters (§3.1), so the cleanup does not apply to them.
 
-Where the spec leaves a choice, the service decides as follows:
+Where the specification leaves a choice, the service decides as follows:
 
 - A Name starting with a digit has that digit as its shoulder, following the definition "one or more betanumeric characters ending in a digit" (§2.4.1). A Name that does not start with a primordinal shoulder has no shoulder.
 - Normalization removes no inflections (§3.2 step 7). Inflections such as `?info` travel in the query string, which step 2 removes, and resolution forwards them to the target.
-- The steps run in the spec's order, so `ark://BCDFG/x6` keeps its uppercase NAAN: step 4 runs before step 8 removes the extra `/`.
+- `ark://BCDFG/x6` keeps its uppercase NAAN: step 4 runs before step 8 removes the extra `/`.
 
-`tests/conformance.rs` holds the conformance table. Each rule the service implements has an ID, each case cites the rules it exercises, and a test fails when a rule has no case. A new rule needs an ID in `RULES` and at least one case. `tests/properties.rs` checks invariants over generated ARKs: published and transcribed variants normalize to the same ARK, minted ARKs validate and parse back to their shoulder, and the check character detects every single-character substitution and adjacent transposition.
+`tests/conformance.rs` holds the conformance table. Each rule the service implements has an ID, each case cites the rules it exercises, and a test fails when a rule has no case. Give a new rule an ID in `RULES` and at least one case. `tests/properties.rs` checks invariants over generated ARKs: published and transcribed variants normalize to the same ARK, minted ARKs validate and parse back to their shoulder, and the check character detects every single-character substitution and adjacent transposition.
 
 ## Design
 
@@ -83,11 +81,10 @@ It does not provide:
 
 - binding metadata or URLs to individual ARKs;
 - sequential or patterned minting (Noid templates such as `.rdde` or `.zeddk`);
-- persistent storage, collision detection or duplicate prevention;
 - Noid's hold, queue, peppermint, update and fetch operations;
 - metrics endpoints.
 
-It suits projects that track ARK-to-resource mappings in their own database, mint moderate volumes, and run containerized infrastructure. It does not suit projects that need Noid's bind, fetch and update operations, guaranteed uniqueness without external tracking, sequential identifiers, or a resolver that stores metadata.
+It suits projects that track ARK-to-resource mappings in their own database, mint moderate volumes, and run containerized infrastructure.
 
 | Feature              | This service               | Noid                         |
 | -------------------- | -------------------------- | ---------------------------- |
@@ -202,8 +199,8 @@ POST /api/v1/validate
 `valid` reflects only the specification: the label, a betanumeric NAAN, a Name, and characters within the ARK repertoire. An ARK from any NAAN, minted by any rules, is valid if it conforms. The other fields report:
 
 - `naan`, `shoulder`, `blade`: the normalized components. `shoulder` is `null` when the Name does not start with a primordinal shoulder; `blade` is then the whole base Name.
-- `naan_matches`: whether the NAAN is this resolver's NAAN.
-- `shoulder_registered`: whether the shoulder is registered under this resolver's NAAN; `null` when the NAAN does not match. The ARK redirects when both fields are `true`.
+- `naan_matches`: whether the NAAN is the service's NAAN.
+- `shoulder_registered`: whether the shoulder is configured under the service's NAAN; `null` when the NAAN does not match. The ARK redirects when both fields are `true`.
 - `has_check_character`: the value from the request, or `null`.
 - `check_character_valid`: the check character result, or `null` when no check character was tested, which includes ARKs without a blade. A wrong check character does not change `valid`.
 - `error`: why the ARK is not valid.
@@ -302,7 +299,7 @@ Location: https://alpha.example.org/x6np1wh8kc/page2.pdf
 
 Errors, each with a plain-text body:
 
-- `400 Bad Request`: the path is not an ARK that conforms to the specification, the NAAN is not this resolver's, or the target's path would contain a `.` or `..` segment, encoded or not.
+- `400 Bad Request`: the path is not an ARK that conforms to the specification, the NAAN is not the service's, or the target's path would contain a `.` or `..` segment, encoded or not.
 - `404 Not Found`: the shoulder is not configured, the Name has no primordinal shoulder, or the path does not start with an ARK label.
 - `500 Internal Server Error`: the shoulder's `route_pattern` built no valid URL.
 
@@ -368,7 +365,7 @@ export SHOULDERS='{
 - `uses_check_character` (optional, default `true`): whether minted ARKs end with a check character.
 - `blade_length` (optional, at least 1): the shoulder's blade length without the check character; `DEFAULT_BLADE_LENGTH` applies without it.
 
-Each key must be a primordinal shoulder, such as `x6` or `bcd7`: ARKs minted under any other key could never resolve, so such a key stops the service, as do unknown fields.
+Each key must be a primordinal shoulder, such as `x6` or `bcd7`: ARKs minted under any other key could never resolve, so such a key stops the service. Unknown fields also stop the service.
 
 `SHOULDERS` also accepts a simple format of comma-separated entries with three tab-separated fields, shoulder, route pattern and project name. A literal `\t` counts as a tab, as Docker Compose YAML passes it. Entries in this format use check characters and `DEFAULT_BLADE_LENGTH`, and their fields cannot contain commas or tabs.
 
@@ -378,7 +375,7 @@ export SHOULDERS='x6\thttps://alpha.example.org/${value}\tProject Alpha,b3\thttp
 
 ### Route patterns
 
-A `route_pattern` is an `http` or `https` URL. Without template variables, the service appends the ARK to it, so the pattern ends with `/` or `=`. With template variables, each variable carries its part of the ARK as requested, including hyphens and letter case. Each `${var}` may also be written `{var}`. For `ark:12345/x6np1wh8k/page2.pdf`:
+A `route_pattern` is an `http` or `https` URL. Without template variables, the service appends the ARK to it; end such a pattern with `/` or `=`. With template variables, each variable carries its part of the ARK as requested, including hyphens and letter case. Each `${var}` may also be written `{var}`. For `ark:12345/x6np1wh8k/page2.pdf`:
 
 - `${pid}`: `ark:12345/x6np1wh8k/page2.pdf`, always with the label `ark:`
 - `${scheme}`: `ark`
@@ -409,6 +406,6 @@ The service listens on `http://0.0.0.0:3000`, or on the port in `PORT`, and stop
 
 ## Releases
 
-CI runs formatting, clippy and the tests before it builds an image. Pushes to `main` publish the tags `main` and `sha-<commit>`. A `v*.*.*` tag publishes the version tags, the major-version tag only from 1.0 on; a tag without a prerelease suffix, such as `v0.1.0` but not `v0.1.0-alpha`, also moves `latest`, so `latest` always points at a release.
+CI runs formatting, clippy and the tests before it builds an image. Pushes to `main` publish the tags `main` and `sha-<commit>`. A `v*.*.*` tag publishes the version tags, the major-version tag only from 1.0 on. A tag without a prerelease suffix, such as `v0.1.0` but not `v0.1.0-alpha`, also moves `latest`, so `latest` always points at a release.
 
 The image checks its own health with `curl` against `/ark:${NAAN}/servicestatus`.

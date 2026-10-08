@@ -13,7 +13,7 @@ fn normalized(ark: &str) -> Option<String> {
     parse_ark(ark).ok().map(|ark| ark.normalized().to_string())
 }
 
-/// A normalized ARK: betanumeric NAAN, a base Name and up to three qualifier segments.
+/// A normalized ARK: betanumeric NAAN, a base Name and up to two qualifier segments.
 fn canonical_ark() -> impl Strategy<Value = String> {
     (
         "[0-9bcdfghjkmnpqrstvwxz]{1,8}",

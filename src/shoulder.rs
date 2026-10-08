@@ -65,7 +65,8 @@ const VARIABLES: &[(&str, Part)] = &[
     ("value", Part::Value),
 ];
 
-/// Lowercase ASCII, so it survives host normalization and shows up wherever it lands.
+/// Lowercase ASCII, so host normalization leaves it intact and a search finds it in any URL
+/// component.
 const SENTINEL: &str = "arkplaceholder";
 
 impl Shoulder {

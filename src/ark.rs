@@ -12,7 +12,6 @@ pub fn is_betanumeric(s: &str) -> bool {
     s.bytes().all(|b| BETANUMERIC.contains(&b))
 }
 
-/// Whether `s` starts with the label "ark:" in any letter case.
 pub fn has_label(s: &str) -> bool {
     starts_with_ignore_case(s, LABEL)
 }
@@ -45,7 +44,7 @@ impl fmt::Display for ParseError {
     }
 }
 
-/// Why a parsed ARK does not conform to the spec.
+/// Why a parsed ARK does not conform to the specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Violation {
     NaanNotBetanumeric,
@@ -207,7 +206,7 @@ pub fn parse_ark(input: &str) -> Result<Ark, ParseError> {
 
 /// §3.2 steps 2 to 8, for an ARK that starts with its label.
 ///
-/// Step 7 removes no inflections: this resolver forwards them to the target, and step 2 has
+/// Step 7 removes no inflections: the service forwards them to the target, and step 2 has
 /// already removed the query string that carries `?info`.
 fn normalize(ark: &str) -> String {
     let ark = strip_query(ark);
@@ -256,7 +255,6 @@ fn strip_query(ark: &str) -> &str {
     split_query(ark).0
 }
 
-/// Splits at the first '?' into the part before it and the query string after it.
 fn split_query(s: &str) -> (&str, Option<&str>) {
     match s.split_once('?') {
         Some((before, query)) => (before, Some(query)),

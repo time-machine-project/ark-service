@@ -4,7 +4,7 @@ use crate::error::AppError;
 
 /// Resolves a received ARK to the target URL of its shoulder
 ///
-/// The normalized NAAN and shoulder select the shoulder; the target receives the ARK as
+/// The normalized NAAN and shoulder select the shoulder; the target gets the ARK as
 /// received, with the label as "ark:".
 pub fn resolve(state: &AppState, received: &str) -> Result<String, AppError> {
     let ark = parse_ark(received).map_err(|_| AppError::InvalidArk)?;

@@ -86,20 +86,39 @@ It does not provide:
 
 It suits projects that track ARK-to-resource mappings in their own database, mint moderate volumes, and run containerized infrastructure.
 
-| Feature              | This service               | Noid                         |
-| -------------------- | -------------------------- | ---------------------------- |
-| ARK generation       | Random only                | Random + sequential patterns |
-| Storage              | None                       | Berkeley DB                  |
-| Binding ARKs to URLs | No (you manage externally) | Yes (bind command)           |
-| Collision detection  | No                         | Yes                          |
-| Scaling              | Horizontal (stateless)     | Vertical (single DB)         |
-| Setup                | Environment variables      | Database and templates       |
-| Shoulders            | Yes (multiple)             | Yes (via templates)          |
-| Check characters     | Yes (NCDA)                 | Yes (NCDA)                   |
+| Feature | This service | Noid |
+| --- | --- | --- |
+| ARK generation | Random only | Random + sequential patterns |
+| Storage | None | Berkeley DB |
+| Binding ARKs to URLs | No (you manage externally) | Yes (bind command) |
+| Collision detection | No | Yes |
+| Scaling | Horizontal (stateless) | Vertical (single DB) |
+| Setup | Environment variables | Database and templates |
+| Shoulders | Yes (multiple) | Yes (via templates) |
+| Check characters | Yes (NCDA) | Yes (NCDA) |
+
+### Collision risk
+
+Random blades of length n come from 29^n possible values. The birthday bound gives the number of minted ARKs at which a collision becomes 1% likely, about √(0.02 × 29^n):
+
+| Blade length | Possible blades  | 1% collision risk at |
+| ------------ | ---------------- | -------------------- |
+| 6            | ~595 million     | ~3,450 ARKs          |
+| 8            | ~500 billion     | ~100,000 ARKs        |
+| 10           | ~421 trillion    | ~2.9 million ARKs    |
+| 12           | ~354 quadrillion | ~84 million ARKs     |
+
+At 8 characters, 10,000 ARKs carry a collision risk of about 0.01%, 100,000 ARKs about 1%, and 1 million ARKs about 63%. Volumes beyond the 1% point need a longer blade or external collision detection.
 
 ## API reference
 
 The examples use the default address `http://localhost:3000` and the configuration from [Shoulders](#shoulders-configuration): NAAN `12345`, shoulder `x6` with a 10-character blade and check characters, shoulder `b3` with the default 8-character blade and no check characters.
+
+The `POST` endpoints answer a body they cannot read with a plain-text message:
+
+- `415 Unsupported Media Type`: the header `Content-Type: application/json` is missing.
+- `400 Bad Request`: the body is not JSON.
+- `422 Unprocessable Entity`: the body does not match the endpoint's fields, such as a missing `shoulder` or a `count` that is not a non-negative integer.
 
 ### Health check
 
@@ -193,7 +212,7 @@ POST /api/v1/validate
 }
 ```
 
-- `arks` (required): ARKs to validate, with or without a resolver prefix such as `https://n2t.net/`. More than 1000 return `400 Bad Request`.
+- `arks` (required): ARKs to validate, with or without an NMA in front, such as `https://n2t.net/`. More than 1000 return `400 Bad Request`.
 - `has_check_character` (optional): `true` tests the last character of the base Name as an NCDA check character. Otherwise no check character is tested.
 
 `valid` reflects only the specification: the label, a betanumeric NAAN, a Name, and characters within the ARK repertoire. An ARK from any NAAN, minted by any rules, is valid if it conforms. The other fields report:
@@ -205,6 +224,8 @@ POST /api/v1/validate
 - `check_character_valid`: the check character result, or `null` when no check character was tested, which includes ARKs without a blade. A wrong check character does not change `valid`.
 - `error`: why the ARK is not valid.
 - `warnings`: any of `Blade contains non-betanumeric characters`, `NAAN does not match this resolver`, `Shoulder is not registered in this resolver` and `Check character does not match`.
+
+`error` and an empty `warnings` are left out. An input without an ARK label, NAAN or Name, such as `doi:10.1/x`, has `null` for `naan`, `shoulder`, `blade`, `naan_matches`, `shoulder_registered` and `check_character_valid`, and `error` names the missing part.
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/validate \
@@ -276,8 +297,6 @@ An ARK with a character outside the repertoire:
 }
 ```
 
-A request without the header `Content-Type: application/json` returns `415 Unsupported Media Type`, a body that is not JSON `400 Bad Request`, and one without `arks` or `shoulder` `422 Unprocessable Entity`, each with a plain-text message.
-
 ### Resolve ARKs
 
 Redirects an ARK to the target its shoulder's `route_pattern` builds.
@@ -286,7 +305,7 @@ Redirects an ARK to the target its shoulder's `route_pattern` builds.
 GET /ark:{naan}/{shoulder}{blade}[{qualifier}]
 ```
 
-The label may be `ark:` or `ark:/` in any letter case. The service selects the shoulder by the normalized NAAN and shoulder, so `ark:12345/x-6np1wh8kc` resolves like `ark:12345/x6np1wh8kc`. The target receives the ARK as requested, with the label written as `ark:`; the ARK's query string, such as `?info`, becomes the target's query string. The redirect target is serialized as a URL, which percent-encodes characters a URL cannot contain.
+The label may be `ark:` or `ark:/` in any letter case. The service selects the shoulder by the normalized NAAN and shoulder, so `ark:12345/x-6np1wh8kc` resolves like `ark:12345/x6np1wh8kc`. The target gets the ARK as received, with the label written as `ark:`; the ARK's query string, such as `?info`, becomes the target's query string. The redirect target is serialized as a URL, which percent-encodes characters a URL cannot contain.
 
 ```bash
 curl -I http://localhost:3000/ark:12345/x6np1wh8kc/page2.pdf
@@ -327,18 +346,9 @@ Optional, default 8, at least 1. The number of random characters in a minted bla
 
 Optional, default 1000, at least 1. The largest number of ARKs one mint request returns.
 
-### Collision risk
+### RUST_LOG
 
-Random blades of length n come from 29^n possible values. The birthday bound gives the number of minted ARKs at which a collision becomes 1% likely, about √(0.02 × 29^n):
-
-| Blade length | Possible blades  | 1% collision risk at |
-| ------------ | ---------------- | -------------------- |
-| 6            | ~595 million     | ~3,450 ARKs          |
-| 8            | ~500 billion     | ~100,000 ARKs        |
-| 10           | ~421 trillion    | ~2.9 million ARKs    |
-| 12           | ~354 quadrillion | ~84 million ARKs     |
-
-At 8 characters, 10,000 ARKs carry a collision risk of about 0.01%, 100,000 ARKs about 1%, and 1 million ARKs about 63%. Volumes beyond the 1% point need a longer blade or external collision detection.
+Optional, default `info`. The log filter in the [`EnvFilter` syntax](https://docs.rs/tracing-subscriber/0.3/tracing_subscriber/filter/struct.EnvFilter.html), such as `warn` or `ark_service=debug`. Logs go to standard output.
 
 ### SHOULDERS configuration
 
@@ -375,7 +385,7 @@ export SHOULDERS='x6\thttps://alpha.example.org/${value}\tProject Alpha,b3\thttp
 
 ### Route patterns
 
-A `route_pattern` is an `http` or `https` URL. Without template variables, the service appends the ARK to it; end such a pattern with `/` or `=`. With template variables, each variable carries its part of the ARK as requested, including hyphens and letter case. Each `${var}` may also be written `{var}`. For `ark:12345/x6np1wh8k/page2.pdf`:
+A `route_pattern` is an `http` or `https` URL. Without template variables, the service appends the ARK to it; end such a pattern with `/` or `=`. With template variables, each variable carries its part of the ARK as received, including hyphens and letter case. Each `${var}` may also be written `{var}`. For `ark:12345/x6np1wh8k/page2.pdf`:
 
 - `${pid}`: `ark:12345/x6np1wh8k/page2.pdf`, always with the label `ark:`
 - `${scheme}`: `ark`
@@ -395,6 +405,17 @@ Variables may appear in the path, query or fragment, never in the scheme, user i
 
 ## Running the service
 
+From the image:
+
+```bash
+docker run -p 3000:3000 \
+  -e NAAN="12345" \
+  -e SHOULDERS='{"x6":{"route_pattern":"https://example.org/${value}","project_name":"Test Project"}}' \
+  ghcr.io/time-machine-project/ark-service:latest
+```
+
+From source:
+
 ```bash
 export NAAN="12345"
 export SHOULDERS='{"x6":{"route_pattern":"https://example.org/${value}","project_name":"Test Project"}}'
@@ -402,7 +423,7 @@ export SHOULDERS='{"x6":{"route_pattern":"https://example.org/${value}","project
 cargo run --release
 ```
 
-The service listens on `http://0.0.0.0:3000`, or on the port in `PORT`, and stops on SIGTERM or Ctrl-C after finishing open requests.
+The service stops on SIGTERM or Ctrl-C after finishing open requests.
 
 ## Releases
 

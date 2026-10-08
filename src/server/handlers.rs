@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mints_for_a_registered_shoulder() {
+    async fn mints_for_a_configured_shoulder() {
         let payload = MintRequest {
             shoulder: "x6".to_string(),
             count: 3,

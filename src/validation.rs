@@ -51,9 +51,9 @@ impl Serialize for Warning {
 
 /// Validates an ARK against draft-kunze-ark-43
 ///
-/// `valid` reflects only the spec. Whether this resolver would redirect the ARK is reported in
-/// `naan_matches` and `shoulder_registered`, and the check character is tested only when the
-/// caller says the ARK has one.
+/// `valid` reflects only the specification. Whether the service would redirect the ARK is
+/// reported in `naan_matches` and `shoulder_registered`, and the check character is tested only
+/// when the caller says the ARK has one.
 pub fn validate_ark(
     state: &AppState,
     ark: &str,

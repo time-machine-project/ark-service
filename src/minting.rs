@@ -19,7 +19,7 @@ pub fn mint_ark(
     format!("{LABEL}{zone}")
 }
 
-/// Mints `count` ARKs for a registered shoulder, capped at `state.max_mint_count`.
+/// Mints `count` ARKs for a configured shoulder, capped at `state.max_mint_count`.
 pub fn mint_arks(state: &AppState, shoulder: &str, count: usize) -> Result<Vec<String>, AppError> {
     let config = state
         .shoulders

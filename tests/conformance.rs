@@ -106,7 +106,7 @@ const RULES: &[(&str, &str)] = &[
     ),
     (
         "resolve-conformant",
-        "Only ARKs that conform to the spec are resolved",
+        "Only ARKs that conform to the specification are resolved",
     ),
     (
         "resolve-dot-segments",

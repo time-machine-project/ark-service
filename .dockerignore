@@ -1,46 +1,37 @@
-# Git
 .git
 .gitignore
 
-# Rust build artifacts
 target/
 **/*.rs.bk
 *.pdb
 
-# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# CI/CD
 .github/
 
-# Documentation
 *.md
 !README.md
 
-# Docker
 Dockerfile
 .dockerignore
 
-# Environment files
 .env
 .env.local
 .env.*.local
 
-# Logs
 *.log
 
-# OS
 .DS_Store
 Thumbs.db
 
-# Project specific
 .claude/
 .direnv/
 .envrc
 .markdownlint.yml
+.prettierrc
 justfile
 temp/

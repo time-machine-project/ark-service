@@ -1,266 +1,152 @@
-use rand::Rng;
+use rand::RngExt;
 
+use crate::ark::{BETANUMERIC, LABEL, check_zone};
 use crate::check_character::calculate_check_character;
-use crate::config::{AppState, BETANUMERIC};
+use crate::config::AppState;
 use crate::error::AppError;
 
-/// Mint a single new ARK with the given NAAN, shoulder, blade length, and check character option
+/// Mints one ARK; `blade_length` excludes the check character.
 pub fn mint_ark(
     naan: &str,
     shoulder: &str,
     blade_length: usize,
     uses_check_character: bool,
 ) -> String {
-    let blade = generate_random_blade(blade_length);
-
+    let mut zone = check_zone(naan, shoulder, &random_blade(blade_length));
     if uses_check_character {
-        let identifier_for_check = format!("{}{}", shoulder, blade);
-        let check_character = calculate_check_character(&identifier_for_check);
-        format!("ark:{}/{}{}{}", naan, shoulder, blade, check_character)
-    } else {
-        format!("ark:{}/{}{}", naan, shoulder, blade)
+        zone.push(calculate_check_character(&zone));
     }
+    format!("{LABEL}{zone}")
 }
 
-/// Mints multiple ARK identifiers for a given shoulder
-///
-/// # Arguments
-/// * `state` - The application state containing NAAN and shoulder configurations
-/// * `shoulder` - The shoulder identifier to mint ARKs for
-/// * `count` - The number of ARKs to mint (will be capped at max_mint_count for safety)
-///
-/// # Returns
-/// * `Ok(Vec<String>)` - Vector of minted ARK identifiers
-/// * `Err(AppError)` - If the shoulder is not found
+/// Mints `count` ARKs for a registered shoulder, capped at `state.max_mint_count`.
 pub fn mint_arks(state: &AppState, shoulder: &str, count: usize) -> Result<Vec<String>, AppError> {
-    // Verify shoulder exists and get its configuration
-    let shoulder_config = state
+    let config = state
         .shoulders
         .get(shoulder)
-        .ok_or_else(|| {
-            tracing::debug!(
-                shoulder = %shoulder,
-                "Mint failed: shoulder not found"
-            );
-            AppError::ShoulderNotFound
-        })?;
+        .ok_or(AppError::ShoulderNotFound)?;
 
-    // Limit count for safety
-    let original_count = count;
-    let count = count.min(state.max_mint_count);
-
-    if original_count > count {
-        tracing::warn!(
-            shoulder = %shoulder,
-            requested_count = original_count,
-            capped_count = count,
-            max_mint_count = state.max_mint_count,
-            "Mint request exceeded maximum, count capped"
-        );
+    let minted = count.min(state.max_mint_count);
+    if minted < count {
+        tracing::warn!(shoulder = ?shoulder, requested = count, minted, "Mint request capped");
     }
 
-    // Use shoulder-specific blade length if configured, otherwise use default
-    let blade_length = shoulder_config
-        .blade_length
-        .unwrap_or(state.default_blade_length);
-
-    tracing::debug!(
-        shoulder = %shoulder,
-        count = count,
-        blade_length = blade_length,
-        uses_check_character = shoulder_config.uses_check_character,
-        "Minting ARKs"
-    );
-
-    // Generate ARKs with or without check characters based on shoulder config
-    let arks: Vec<String> = (0..count)
+    let blade_length = state.blade_length(config);
+    Ok((0..minted)
         .map(|_| {
             mint_ark(
                 &state.naan,
                 shoulder,
                 blade_length,
-                shoulder_config.uses_check_character,
+                config.uses_check_character,
             )
         })
-        .collect();
-
-    Ok(arks)
+        .collect())
 }
 
-/// Generate a random blade using betanumeric characters
-fn generate_random_blade(blade_length: usize) -> String {
+fn random_blade(length: usize) -> String {
     let mut rng = rand::rng();
-    (0..blade_length)
-        .map(|_| {
-            let idx = rng.random_range(0..BETANUMERIC.len());
-            BETANUMERIC[idx] as char
-        })
+    (0..length)
+        .map(|_| BETANUMERIC[rng.random_range(0..BETANUMERIC.len())] as char)
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ark::parse_ark, config::BETANUMERIC, shoulder::Shoulder};
+    use crate::ark::parse_ark;
+    use crate::check_character::validate_check_character;
+    use crate::shoulder::Shoulder;
     use std::collections::HashMap;
 
-    fn create_test_state(uses_check_character: bool) -> AppState {
-        let mut shoulders = HashMap::new();
-        shoulders.insert(
-            "x6".to_string(),
-            Shoulder {
-                route_pattern: "https://example.org/${value}".to_string(),
-                project_name: "Test Project".to_string(),
-                uses_check_character,
-                ..Default::default()
-            },
-        );
-
+    fn create_test_state(shoulders: &[(&str, Shoulder)]) -> AppState {
         AppState {
             naan: "12345".to_string(),
             default_blade_length: 8,
             max_mint_count: 1000,
-            shoulders,
+            shoulders: shoulders
+                .iter()
+                .map(|(name, shoulder)| (name.to_string(), shoulder.clone()))
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    fn with_check_character(uses_check_character: bool, blade_length: Option<usize>) -> Shoulder {
+        Shoulder {
+            uses_check_character,
+            blade_length,
+            ..Default::default()
         }
     }
 
     #[test]
     fn mints_requested_number_of_arks() {
-        let state = create_test_state(true);
+        let state = create_test_state(&[("x6", Shoulder::default())]);
         let arks = mint_arks(&state, "x6", 5).unwrap();
 
         assert_eq!(arks.len(), 5);
-        for ark in arks {
-            assert!(ark.starts_with("ark:12345/x6"));
-        }
+        assert!(arks.iter().all(|ark| ark.starts_with("ark:12345/x6")));
     }
 
     #[test]
-    fn enforces_maximum_count_limit() {
-        let state = create_test_state(true);
-        let arks = mint_arks(&state, "x6", 5000).unwrap();
-
-        assert_eq!(arks.len(), 1000);
+    fn caps_the_count_at_max_mint_count() {
+        let state = create_test_state(&[("x6", Shoulder::default())]);
+        assert_eq!(mint_arks(&state, "x6", 5000).unwrap().len(), 1000);
     }
 
     #[test]
-    fn returns_error_for_invalid_shoulder() {
-        let state = create_test_state(true);
-        let result = mint_arks(&state, "invalid", 1);
-
-        assert!(matches!(result, Err(AppError::ShoulderNotFound)));
+    fn returns_error_for_unknown_shoulder() {
+        let state = create_test_state(&[("x6", Shoulder::default())]);
+        assert_eq!(mint_arks(&state, "z9", 1), Err(AppError::ShoulderNotFound));
     }
 
     #[test]
-    fn mints_ark_with_check_character() {
+    fn appends_a_valid_check_character() {
         let ark = mint_ark("12345", "x6", 8, true);
-
-        assert!(ark.starts_with("ark:12345/x6"));
-        assert_eq!(ark.len(), "ark:12345/x6".len() + 9); // 8 blade + 1 check
-
         let parsed = parse_ark(&ark).unwrap();
-        assert_eq!(parsed.naan, "12345");
-        assert_eq!(parsed.shoulder, "x6");
-        assert_eq!(parsed.blade.len(), 9);
+
+        assert_eq!(parsed.shoulder(), Some("x6"));
+        assert_eq!(parsed.blade().len(), 8 + 1);
+        assert!(validate_check_character(&parsed.check_zone()));
     }
 
     #[test]
-    fn mints_ark_without_check_character() {
+    fn mints_without_check_character() {
         let ark = mint_ark("12345", "x6", 8, false);
-
-        assert!(ark.starts_with("ark:12345/x6"));
-        assert_eq!(ark.len(), "ark:12345/x6".len() + 8); // 8 blade only
-
-        let parsed = parse_ark(&ark).unwrap();
-        assert_eq!(parsed.naan, "12345");
-        assert_eq!(parsed.shoulder, "x6");
-        assert_eq!(parsed.blade.len(), 8);
+        assert_eq!(parse_ark(&ark).unwrap().blade().len(), 8);
     }
 
     #[test]
     fn generates_random_betanumeric_blades() {
-        let blade1 = generate_random_blade(8);
-        let blade2 = generate_random_blade(8);
+        let blade1 = random_blade(8);
+        let blade2 = random_blade(8);
 
         assert_eq!(blade1.len(), 8);
-        assert_eq!(blade2.len(), 8);
         assert_ne!(blade1, blade2);
-
-        for ch in blade1.chars().chain(blade2.chars()) {
-            assert!(BETANUMERIC.contains(&(ch as u8)));
-        }
+        assert!(
+            blade1
+                .bytes()
+                .chain(blade2.bytes())
+                .all(|b| BETANUMERIC.contains(&b))
+        );
     }
 
     #[test]
-    fn uses_shoulder_specific_blade_length() {
-        let mut shoulders = HashMap::new();
-        // Shoulder with custom blade length
-        shoulders.insert(
-            "x6".to_string(),
-            Shoulder {
-                route_pattern: "https://example.org/${value}".to_string(),
-                project_name: "Custom Length Project".to_string(),
-                uses_check_character: false,
-                blade_length: Some(12),
-            },
-        );
-        // Shoulder using default blade length
-        shoulders.insert(
-            "b3".to_string(),
-            Shoulder {
-                route_pattern: "https://example.org/${value}".to_string(),
-                project_name: "Default Length Project".to_string(),
-                uses_check_character: false,
-                ..Default::default()
-            },
-        );
+    fn uses_the_shoulder_blade_length_or_the_default() {
+        let state = create_test_state(&[
+            ("x6", with_check_character(false, Some(12))),
+            ("b3", with_check_character(false, None)),
+            ("fk4", with_check_character(true, Some(10))),
+        ]);
 
-        let state = AppState {
-            naan: "12345".to_string(),
-            default_blade_length: 8,
-            max_mint_count: 1000,
-            shoulders,
+        let blade = |shoulder| {
+            parse_ark(&mint_arks(&state, shoulder, 1).unwrap()[0])
+                .unwrap()
+                .blade()
+                .len()
         };
-
-        // Test shoulder with custom blade length (12 characters)
-        let arks_x6 = mint_arks(&state, "x6", 1).unwrap();
-        assert_eq!(arks_x6.len(), 1);
-        let parsed_x6 = parse_ark(&arks_x6[0]).unwrap();
-        assert_eq!(parsed_x6.blade.len(), 12); // Custom length
-
-        // Test shoulder with default blade length (8 characters)
-        let arks_b3 = mint_arks(&state, "b3", 1).unwrap();
-        assert_eq!(arks_b3.len(), 1);
-        let parsed_b3 = parse_ark(&arks_b3[0]).unwrap();
-        assert_eq!(parsed_b3.blade.len(), 8); // Default length
-    }
-
-    #[test]
-    fn uses_shoulder_blade_length_with_check_character() {
-        let mut shoulders = HashMap::new();
-        shoulders.insert(
-            "fk4".to_string(),
-            Shoulder {
-                route_pattern: "https://example.org/${value}".to_string(),
-                project_name: "Custom Length with Check".to_string(),
-                blade_length: Some(10),
-                ..Default::default()
-            },
-        );
-
-        let state = AppState {
-            naan: "99999".to_string(),
-            default_blade_length: 8,
-            max_mint_count: 1000,
-            shoulders,
-        };
-
-        let arks = mint_arks(&state, "fk4", 1).unwrap();
-        assert_eq!(arks.len(), 1);
-        let parsed = parse_ark(&arks[0]).unwrap();
-        // Blade should be 11 characters (10 + 1 check character)
-        assert_eq!(parsed.blade.len(), 11);
-        assert_eq!(parsed.naan, "99999");
-        assert_eq!(parsed.shoulder, "fk4");
+        assert_eq!(blade("x6"), 12);
+        assert_eq!(blade("b3"), 8);
+        assert_eq!(blade("fk4"), 10 + 1);
     }
 }

@@ -1,164 +1,124 @@
-use std::sync::LazyLock;
+use crate::ark::BETANUMERIC;
 
-use crate::config::BETANUMERIC;
-
-/// Pre-computed lookup table for O(1) betanumeric ordinal lookup.
-/// Maps ASCII byte values (0-255) to their betanumeric ordinal (0-28).
-/// Characters not in the betanumeric alphabet map to 0.
-/// Both uppercase and lowercase letters map to the same ordinal.
-///
-/// Initialized lazily on first access using `LazyLock`.
-static BETANUMERIC_LOOKUP: LazyLock<[u8; 256]> = LazyLock::new(|| {
+/// Ordinal of each byte in the betanumeric alphabet; every other byte, uppercase letters
+/// included, maps to 0 as in Noid.
+const ORDINALS: [u8; 256] = {
     let mut table = [0u8; 256];
-
-    // Map each betanumeric character to its ordinal (0-28)
-    for (ordinal, &ch) in BETANUMERIC.iter().enumerate() {
-        table[ch as usize] = ordinal as u8;
-
-        // Also map uppercase version to same ordinal (for letters only)
-        if ch.is_ascii_lowercase() {
-            table[ch.to_ascii_uppercase() as usize] = ordinal as u8;
-        }
+    let mut ordinal = 0;
+    while ordinal < BETANUMERIC.len() {
+        table[BETANUMERIC[ordinal] as usize] = ordinal as u8;
+        ordinal += 1;
     }
-
     table
-});
+};
 
-/// Calculate the NCDA check character for a given identifier string.
+/// Calculates the NCDA check character of a check zone without its check character.
 ///
-/// This function implements the Noid Check Digit Algorithm (NCDA), which is a "perfect"
-/// algorithm for detecting single character errors and transposition errors (swapping
-/// adjacent characters) in identifiers.
-///
-/// The algorithm uses the "betanumeric" character set (digits 0-9 plus lowercase letters
-/// excluding vowels and 'l'): `0123456789bcdfghjkmnpqrstvwxz` (29 characters, prime radix).
-///
-/// # Algorithm
-///
-/// For each character in the input string:
-/// 1. Convert to lowercase
-/// 2. Find its position in the betanumeric alphabet (0-28)
-/// 3. Characters not in the alphabet get ordinal value 0 (e.g., '/')
-/// 4. Multiply ordinal by position (1-indexed)
-/// 5. Sum all products
-/// 6. Check character is at position (sum mod 29) in the alphabet
-///
-/// See the [NOID Check Digit Algorithm specification](https://metacpan.org/dist/Noid/view/noid#NOID-CHECK-DIGIT-ALGORITHM)
-/// for full details.
-///
-/// # Arguments
-///
-/// * `identifier` - The base identifier string (without check character)
-///
-/// # Returns
-///
-/// A single betanumeric character representing the check character
-///
-/// # Examples
+/// For betanumeric strings of up to 28 characters, check character included, the
+/// [Noid Check Digit Algorithm](https://metacpan.org/dist/Noid/view/noid#NOID-CHECK-DIGIT-ALGORITHM)
+/// detects every single-character substitution and every transposition of two adjacent
+/// characters.
 ///
 /// ```
 /// use ark_service::check_character::calculate_check_character;
 ///
-/// // Example from NCDA specification
-/// let check = calculate_check_character("13030/xf93gt2");
-/// assert_eq!(check, 'q');
-///
-/// // Simple example
-/// let check = calculate_check_character("bcd");
-/// // 'b'=10, 'c'=11, 'd'=12 (ordinals in betanumeric)
-/// // Position 1: 10 * 1 = 10
-/// // Position 2: 11 * 2 = 22
-/// // Position 3: 12 * 3 = 36
-/// // Sum: 68, 68 mod 29 = 10 -> 'b'
-/// assert_eq!(check, 'b');
+/// // Example from the NCDA specification
+/// assert_eq!(calculate_check_character("13030/xf93gt2"), 'q');
 /// ```
-pub fn calculate_check_character(identifier: &str) -> char {
-    let mut total: u64 = 0;
-
-    for (position, ch) in identifier.bytes().enumerate() {
-        // O(1) lookup instead of O(29) linear search
-        let ordinal = BETANUMERIC_LOOKUP[ch as usize] as u64;
-
-        total += (position as u64 + 1) * ordinal;
-    }
-
-    let check_ordinal = (total % 29) as usize;
-    BETANUMERIC[check_ordinal] as char
+pub fn calculate_check_character(check_zone: &str) -> char {
+    let total: usize = check_zone
+        .bytes()
+        .enumerate()
+        .map(|(i, b)| (i + 1) * usize::from(ORDINALS[b as usize]))
+        .sum();
+    BETANUMERIC[total % BETANUMERIC.len()] as char
 }
 
-/// Validate that an identifier has a correct check character.
-///
-/// This function extracts the last character from the identifier and verifies
-/// it matches the expected check character calculated from the preceding characters.
-///
-/// # Arguments
-///
-/// * `identifier` - The complete identifier string (including check character)
-///
-/// # Returns
-///
-/// * `true` if the check character is valid
-/// * `false` if the identifier is too short (< 2 chars) or check character is invalid
-///
-/// # Examples
+/// Checks the last character of a complete check zone against the NCDA check character of
+/// the rest; `false` for strings shorter than two characters.
 ///
 /// ```
 /// use ark_service::check_character::validate_check_character;
 ///
-/// // Valid identifier with correct check character 'q'
 /// assert!(validate_check_character("13030/xf93gt2q"));
-///
-/// // Invalid identifier with incorrect check character 'x'
 /// assert!(!validate_check_character("13030/xf93gt2x"));
-///
-/// // Too short
 /// assert!(!validate_check_character("a"));
 /// ```
-///
-/// # Note
-///
-/// This function is case-insensitive since all characters are converted to
-/// lowercase before processing.
-pub fn validate_check_character(identifier: &str) -> bool {
-    if identifier.len() < 2 {
+pub fn validate_check_character(check_zone: &str) -> bool {
+    let Some(provided) = check_zone.chars().last() else {
         return false;
-    }
-
-    let (base, provided_check) = identifier.split_at(identifier.len() - 1);
-    let expected_check = calculate_check_character(base);
-
-    // Case-insensitive comparison
-    provided_check.eq_ignore_ascii_case(&expected_check.to_string())
+    };
+    let base = &check_zone[..check_zone.len() - provided.len_utf8()];
+    !base.is_empty() && provided == calculate_check_character(base)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_check_character_calculation() {
-        let identifier = "13030/xf93gt2";
-        let check = calculate_check_character(identifier);
-        assert_eq!(check, 'q');
+    fn betanumeric_strings(length: usize) -> Vec<String> {
+        (0..length).fold(vec![String::new()], |strings, _| {
+            strings
+                .iter()
+                .flat_map(|s| {
+                    BETANUMERIC
+                        .iter()
+                        .map(move |&c| format!("{s}{}", c as char))
+                })
+                .collect()
+        })
+    }
+
+    fn with_check(base: &str) -> String {
+        format!("{base}{}", calculate_check_character(base))
     }
 
     #[test]
-    fn test_check_character_validation() {
-        assert!(validate_check_character("13030/xf93gt2q"));
-        assert!(!validate_check_character("13030/xf93gt2x"));
-    }
-
-    #[test]
-    fn test_case_insensitive() {
-        // Verify that uppercase and lowercase identifiers produce the same check character
-        assert_eq!(
+    fn uppercase_letters_are_not_betanumeric() {
+        assert!(!validate_check_character("13030/XF93GT2Q"));
+        assert_ne!(
             calculate_check_character("13030/XF93GT2"),
             calculate_check_character("13030/xf93gt2")
         );
+    }
 
-        // Verify validation works with both cases
-        assert!(validate_check_character("13030/XF93GT2Q"));
-        assert!(validate_check_character("13030/xf93gt2q"));
-        assert!(validate_check_character("13030/Xf93Gt2Q")); // Mixed case
+    #[test]
+    fn detects_every_substitution_in_short_strings() {
+        for length in 1..=3 {
+            for base in betanumeric_strings(length) {
+                let correct = with_check(&base).into_bytes();
+                for position in 0..correct.len() {
+                    for &replacement in BETANUMERIC {
+                        if replacement == correct[position] {
+                            continue;
+                        }
+                        let mut wrong = correct.clone();
+                        wrong[position] = replacement;
+                        assert!(!validate_check_character(
+                            std::str::from_utf8(&wrong).unwrap()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detects_every_adjacent_transposition_in_short_strings() {
+        for length in 1..=3 {
+            for base in betanumeric_strings(length) {
+                let correct = with_check(&base).into_bytes();
+                for position in 0..correct.len() - 1 {
+                    if correct[position] == correct[position + 1] {
+                        continue;
+                    }
+                    let mut swapped = correct.clone();
+                    swapped.swap(position, position + 1);
+                    assert!(!validate_check_character(
+                        std::str::from_utf8(&swapped).unwrap()
+                    ));
+                }
+            }
+        }
     }
 }

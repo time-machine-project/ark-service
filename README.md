@@ -1,503 +1,351 @@
 # ARK Service
 
-**A lightweight, stateless service for minting and validating ARK (Archival Resource Key) identifiers.**
+A stateless service that mints, validates and resolves ARKs (Archival Resource Keys).
 
-ARK Service is a Rust-based web service that generates random ARK identifiers with optional NCDA check characters. Unlike traditional ARK minters (Noid, EZID), it's designed for stateless operation with no database required, making it fast and horizontally scalable. The service supports multiple "shoulders" (identifier namespaces) with customizable URL resolution patterns.
+ARK Service mints random ARKs with optional NCDA check characters, validates ARKs against the ARK specification, and redirects ARKs to per-shoulder targets. It keeps no database: the system that assigns an ARK to a resource stores that mapping. The service is written in Rust with Axum and ships as a Docker image on the GitHub Container Registry.
 
-**Key Features:**
-
-- Fast and memory-efficient (built with Rust and Axum)
-- Stateless operation (no database required)
-- Multiple namespace support via shoulders
-- NCDA (Noid Check Digit Algorithm) for error detection
-- Flexible URL resolution with template variables
-- RESTful API for minting and validation
-- Docker-ready with GitHub Container Registry support
-
-## ARK Primer
+## ARK primer
 
 ### Structure
 
 ```
-ark:[/]NAAN/shoulder+blade[/qualifier]
+ark:[/]NAAN/shoulder+blade[qualifier]
 ```
 
-**Example:** `ark:12345/x6np1wh8kq/page2.pdf`
+In `ark:12345/x6np1wh8kc/page2.pdf`:
 
-- **NAAN** (12345): Name Assigning Authority Number - your organization's identifier
-- **Shoulder** (x6): Namespace prefix ending in a digit - separates projects/collections
-- **Blade** (np1wh8kq): The unique identifier, optionally ending with a check character
-- **Qualifier** (page2.pdf): Optional path for variants/components
+- `12345` is the NAAN (Name Assigning Authority Number), the identifier of the assigning organization.
+- `x6` is the shoulder, a namespace inside the NAAN.
+- `np1wh8kc` is the blade; its last character can be a check character.
+- `/page2.pdf` is the qualifier, a path to a component or variant.
 
-Both `ark:` and `ark:/` forms are equivalent.
+The labels `ark:` and `ark:/` are equivalent.
 
 ### Shoulders
 
-A shoulder is a string of betanumeric characters ending in a digit (the "first-digit convention"):
+A primordinal shoulder is one or more betanumeric characters ending in the first digit after the NAAN (the first-digit convention):
 
 ```
-ark:12345/x6np1wh8k    # shoulder is "x6"
-ark:12345/b3th89n      # shoulder is "b3"
-ark:12345/abc7defg     # shoulder is "abc7"
+ark:12345/x6np1wh8k    # shoulder "x6"
+ark:12345/b3th89n      # shoulder "b3"
+ark:12345/bcd7fgh      # shoulder "bcd7"
+ark:12345/abc7fgh      # no shoulder: "a" is not betanumeric
 ```
 
-**Critical:** Never use "/" between shoulder and blade:
+No `/` belongs between shoulder and blade:
 
 ```
 ark:12345/x6np1wh8k/page2.pdf   # correct
-ark:12345/x6/np1wh8k/page2.pdf  # WRONG
+ark:12345/x6/np1wh8k/page2.pdf  # incorrect
 ```
 
-### Betanumeric Character Set
+### Betanumeric characters
 
-ARKs use "betanumeric" characters - digits and consonants (excluding 'l'):
-
-```
-bcdfghjkmnpqrstvwxz0123456789
-```
-
-This avoids vowels (prevents accidental words), excludes confusable characters ('l'/'1', 'o'/'0'), and provides a prime radix (29) for the check character algorithm.
-
-**Case sensitivity:** ARKs are technically case-sensitive, meaning `ark:12345/x6ABC` and `ark:12345/x6abc` are different identifiers. However, this service (like most ARK minters) generates only lowercase identifiers. An important quirk: uppercase and lowercase variants of the same string produce the same check character, since NCDA treats them identically for calculation purposes.
-
-### Check Characters (NCDA)
-
-The Noid Check Digit Algorithm appends a check character to detect transcription errors:
+NAANs, shoulders and minted blades use the betanumeric alphabet, the digits and the lowercase letters without vowels, `y` and `l`:
 
 ```
-Example: ark:13030/xf93gt2q
-                          ^-- check character
+0123456789bcdfghjkmnpqrstvwxz
 ```
 
-The algorithm multiplies each character's ordinal value by its position, sums them, takes modulo 29, and maps back to a betanumeric character. It guarantees detection of:
+The alphabet has no vowels, so minted ARKs contain no words, and no `l`, which is confused with `1`. Its 29 characters give the check character algorithm a prime radix.
 
-- All single character errors
-- All adjacent transposition errors
-- Works for identifiers < 29 characters
+ARKs are case-sensitive outside the label and the NAAN: `ark:12345/x6ABC` and `ark:12345/x6abc` are different ARKs. The service mints lowercase ARKs only.
 
-**Note:** Check characters protect only the base identifier (NAAN + shoulder + blade), not qualifiers.
+### Check characters
 
-**Learn more:** [ARK Specification (IETF)](https://www.ietf.org/archive/id/draft-kunze-ark-34.html) | [NCDA Details](https://metacpan.org/dist/Noid/view/noid#NOID-CHECK-DIGIT-ALGORITHM)
+The Noid Check Digit Algorithm (NCDA) computes a check character over the check zone: the NAAN, `/`, shoulder and blade, without the qualifiers. For `ark:13030/xf93gt2q`, the check character `q` covers `13030/xf93gt2`.
 
-## Design Philosophy & Tradeoffs
+Each character's ordinal in the betanumeric alphabet is multiplied by its position; the sum modulo 29 selects the check character. Characters outside the alphabet, uppercase letters and `/` included, have the ordinal 0, as in Noid. For betanumeric strings of up to 27 characters before the check character, NCDA detects every single-character substitution and every transposition of two adjacent characters, including those that involve the check character. A check zone also contains `/`, which shares the ordinal 0 with `0`, so swapping the two goes undetected. With a five-digit NAAN and a two-character shoulder, that covers blades of up to 19 characters before the check character.
 
-This service differs significantly from traditional ARK minters like Noid and EZID.
+References: [ARK specification (draft-kunze-ark-43)](https://www.ietf.org/archive/id/draft-kunze-ark-43.html), [NCDA](https://metacpan.org/dist/Noid/view/noid#NOID-CHECK-DIGIT-ALGORITHM).
 
-### Architecture Decisions
+### Specification conformance
 
-**Stateless random generation:**
+The service implements [draft-kunze-ark-43](https://www.ietf.org/archive/id/draft-kunze-ark-43.html). Normalization follows the eight steps of §3.2 in order, and matching and validation use the normalized components. The service also applies the optional cleanup of §3.1 to the characters it receives: it removes whitespace and treats U+2010 to U+2015 as hyphens. In a request path these characters arrive percent-encoded, and percent-encoded octets are ARK characters (§3.1), so the cleanup does not apply to them.
 
-- No database or persistent storage required
-- Fast, horizontally scalable, container-friendly
-- **No collision detection** - suitable for moderate volumes only (see blade length guidelines)
-- **No uniqueness guarantees** across service restarts
-- You must manage ARK-to-resource mappings in your own system
+Where the spec leaves a choice, the service decides as follows:
 
-**What's included:**
+- A Name starting with a digit has that digit as its shoulder, following the definition "one or more betanumeric characters ending in a digit" (§2.4.1). A Name that does not start with a primordinal shoulder has no shoulder.
+- Normalization removes no inflections (§3.2 step 7). Inflections such as `?info` travel in the query string, which step 2 removes, and resolution forwards them to the target.
+- The steps run in the spec's order, so `ark://BCDFG/x6` keeps its uppercase NAAN: step 4 runs before step 8 removes the extra `/`.
 
-- Random identifier generation (betanumeric + optional NCDA check characters)
-- Multi-shoulder namespace support
-- Template-based URL resolution (302 redirects)
-- Validation API for check characters and structure
+`tests/conformance.rs` holds the conformance table. Each rule the service implements has an ID, each case cites the rules it exercises, and a test fails when a rule has no case. A new rule needs an ID in `RULES` and at least one case. `tests/properties.rs` checks invariants over generated ARKs: published and transcribed variants normalize to the same ARK, minted ARKs validate and parse back to their shoulder, and the check character detects every single-character substitution and adjacent transposition.
 
-**What's NOT included (vs Noid/EZID):**
+## Design
 
-- ARK binding (associating metadata/URLs with ARKs)
-- Sequential/patterned minting (no `.rdde`/`.zeddk` templates)
-- Persistent storage of minted ARKs
-- Hold/queue/peppermint functionality
-- Update/fetch operations
-- Collision detection or duplicate prevention
+The service mints ARKs at random and stores nothing:
 
-### When to Use This Service
+- It keeps no record of minted ARKs, so it detects no collisions and guarantees no uniqueness, neither between nor within requests. The blade length sets the collision risk (see [Collision risk](#collision-risk)).
+- The system that uses the ARKs maps them to resources.
+- Instances share nothing, so any number can run side by side.
 
-**Good fit:**
+It does not provide:
 
-- You need a simple ARK minter for moderate-scale projects
-- You have your own database for tracking ARK → resource mappings
-- You want stateless, containerized infrastructure
-- Your minting volumes align with the collision risk profiles (see configuration)
+- binding metadata or URLs to individual ARKs;
+- sequential or patterned minting (Noid templates such as `.rdde` or `.zeddk`);
+- persistent storage, collision detection or duplicate prevention;
+- Noid's hold, queue, peppermint, update and fetch operations;
+- metrics endpoints.
 
-**Not a good fit:**
+It suits projects that track ARK-to-resource mappings in their own database, mint moderate volumes, and run containerized infrastructure. It does not suit projects that need Noid's bind, fetch and update operations, guaranteed uniqueness without external tracking, sequential identifiers, or a resolver that stores metadata.
 
-- You need Noid's full feature set (bind, fetch, update)
-- You require guaranteed unique ARKs without external tracking
-- You need sequential or patterned identifiers
-- You're minting millions of ARKs and need collision detection
-- You want an all-in-one resolver with metadata storage
+| Feature              | This service               | Noid                         |
+| -------------------- | -------------------------- | ---------------------------- |
+| ARK generation       | Random only                | Random + sequential patterns |
+| Storage              | None                       | Berkeley DB                  |
+| Binding ARKs to URLs | No (you manage externally) | Yes (bind command)           |
+| Collision detection  | No                         | Yes                          |
+| Scaling              | Horizontal (stateless)     | Vertical (single DB)         |
+| Setup                | Environment variables      | Database and templates       |
+| Shoulders            | Yes (multiple)             | Yes (via templates)          |
+| Check characters     | Yes (NCDA)                 | Yes (NCDA)                   |
 
-### Comparison to Noid
+## API reference
 
-| Feature               | This Service               | Noid                         |
-| --------------------- | -------------------------- | ---------------------------- |
-| Identifier generation | Random only                | Random + sequential patterns |
-| Storage               | Stateless (no DB)          | Berkeley DB                  |
-| Binding ARKs to URLs  | No (you manage externally) | Yes (bind command)           |
-| Collision detection   | No                         | Yes                          |
-| Scalability           | Horizontal (stateless)     | Vertical (single DB)         |
-| Setup complexity      | Low (env vars)             | Medium (DB + templates)      |
-| Shoulders             | Yes (multiple)             | Yes (via templates)          |
-| Check characters      | Yes (NCDA)                 | Yes (NCDA)                   |
+The examples use the default address `http://localhost:3000` and the configuration from [Shoulders](#shoulders-configuration): NAAN `12345`, shoulder `x6` with a 10-character blade and check characters, shoulder `b3` with the default 8-character blade and no check characters.
 
-This service is essentially a stateless random ARK generator with validation - think of it as a building block you integrate into your own system, rather than a complete ARK management solution.
-
----
-
-## Roadmap
-
-This is an MVP focused on the core ARK minting functionality. Future enhancements under consideration:
-
-**Planned features:**
-
-- **Persistent storage backend** - Optional database support for collision detection and ARK tracking
-- **Additional minting algorithms** - Sequential identifiers, custom patterns beyond random generation
-- **ARK binding** - Associate metadata and URLs with minted ARKs (making it a true resolver)
-- **Collision detection** - Track minted ARKs to guarantee uniqueness
-- **Metrics and monitoring** - Prometheus endpoints, minting statistics, usage tracking
-
-**Why not now?**
-The current stateless design addresses the most common use case: fast, simple ARK generation for projects that manage their own ARK-to-resource mappings. Adding these features would increase complexity, so they're being considered based on real-world usage patterns and community feedback.
-
----
-
-## API Reference
-
-The ARK service provides a RESTful API for minting, validating, and resolving ARK identifiers.
-
-### Base URL
-
-```
-http://localhost:3000
-```
-
-### Endpoints
-
-#### 1. Health Check
-
-Check the service status.
+### Health check
 
 ```
 GET /ark:{naan}/servicestatus
 ```
 
-**Example:**
-
 ```bash
 curl http://localhost:3000/ark:12345/servicestatus
 ```
 
-**Response:**
+The response is `OK`.
 
-```
-OK
-```
+### Service info
 
-#### 2. Get Service Info
-
-Get information about the NAAN and configured shoulders.
+Returns the NAAN and the configured shoulders, sorted by shoulder. `example_ark` is a newly minted ARK on every request.
 
 ```
 GET /api/v1/info
 ```
-
-**Example:**
-
-```bash
-curl http://localhost:3000/api/v1/info
-```
-
-**Response:**
 
 ```json
 {
   "naan": "12345",
   "shoulders": [
     {
-      "shoulder": "x6",
-      "project_name": "Project Alpha",
-      "uses_check_character": true,
-      "blade_length": 10,
-      "example_ark": "ark:12345/x6sf2qzhjgz"
-    },
-    {
       "shoulder": "b3",
       "project_name": "Project Beta",
       "uses_check_character": false,
       "blade_length": 8,
-      "example_ark": "ark:12345/b3sf2qzhjg"
+      "example_ark": "ark:12345/b3452jnbtf"
+    },
+    {
+      "shoulder": "x6",
+      "project_name": "Project Alpha",
+      "uses_check_character": true,
+      "blade_length": 10,
+      "example_ark": "ark:12345/x6w0v9gt072wc"
     }
   ]
 }
 ```
 
-#### 3. Mint ARKs
-
-Mint one or more new ARK identifiers for a given shoulder.
+### Mint ARKs
 
 ```
 POST /api/v1/mint
 ```
 
-**Request Body:**
-
 ```json
 {
   "shoulder": "x6",
-  "count": 5
+  "count": 3
 }
 ```
 
-- `shoulder` (required): The shoulder to mint ARKs for
-- `count` (optional): Number of ARKs to mint (default: 1)
-
-**Example:**
+- `shoulder` (required): a configured shoulder.
+- `count` (optional, default 1): the number of ARKs. A larger count than `MAX_MINT_COUNT` returns `MAX_MINT_COUNT` ARKs; `count` in the response gives the number minted.
 
 ```bash
-# Mint a single ARK
 curl -X POST http://localhost:3000/api/v1/mint \
   -H "Content-Type: application/json" \
-  -d '{"shoulder": "x6"}'
-
-# Mint 10 ARKs
-curl -X POST http://localhost:3000/api/v1/mint \
-  -H "Content-Type: application/json" \
-  -d '{"shoulder": "x6", "count": 10}'
+  -d '{"shoulder": "x6", "count": 3}'
 ```
-
-**Response:**
 
 ```json
 {
-  "count": 5,
   "arks": [
-    "ark:12345/x6np1wh8kq",
-    "ark:12345/x6tqb3kh8w",
-    "ark:12345/x6m9zv4xp7",
-    "ark:12345/x6f2hg9nk5",
-    "ark:12345/x6c8dw3bt2"
-  ]
+    "ark:12345/x6k2cnxn92jc9",
+    "ark:12345/x6df013xgp7vz",
+    "ark:12345/x6c2hbnkfws60"
+  ],
+  "count": 3
 }
 ```
 
-**Error Response:**
+An unknown shoulder returns `404 Not Found` with the plain-text body `Shoulder not found`.
 
-```json
-{
-  "error": "Shoulder not found: z9"
-}
-```
+### Validate ARKs
 
-#### 4. Validate ARKs
-
-Validate one or more ARK identifiers and get detailed information about their components.
+Validates up to 1000 ARKs against the specification and returns their components.
 
 ```
 POST /api/v1/validate
 ```
 
-**Request Body:**
-
 ```json
 {
-  "arks": ["ark:12345/x6np1wh8kq", "ark:12345/b3test123"],
+  "arks": ["ark:12345/x6np1wh8kc"],
   "has_check_character": true
 }
 ```
 
-- `arks` (required): Array of ARK identifiers to validate
-- `has_check_character` (optional): Whether to validate the check character. Required for unregistered shoulders (strict mode).
+- `arks` (required): ARKs to validate, with or without a resolver prefix such as `https://n2t.net/`. More than 1000 return `400 Bad Request`.
+- `has_check_character` (optional): `true` tests the last character of the base Name as an NCDA check character. Otherwise no check character is tested.
 
-**Strict Mode Behavior:**
+`valid` reflects only the specification: the label, a betanumeric NAAN, a Name, and characters within the ARK repertoire. An ARK from any NAAN, minted by any rules, is valid if it conforms. The other fields report:
 
-- **Registered shoulders**: Uses the shoulder's configuration for check character validation
-- **Unregistered shoulders with `has_check_character`**: Validates according to the provided hint
-- **Unregistered shoulders without `has_check_character`**: Returns an error (strict mode)
-
-**Example:**
+- `naan`, `shoulder`, `blade`: the normalized components. `shoulder` is `null` when the Name does not start with a primordinal shoulder; `blade` is then the whole base Name.
+- `naan_matches`: whether the NAAN is this resolver's NAAN.
+- `shoulder_registered`: whether the shoulder is registered under this resolver's NAAN; `null` when the NAAN does not match. The ARK redirects when both fields are `true`.
+- `has_check_character`: the value from the request, or `null`.
+- `check_character_valid`: the check character result, or `null` when no check character was tested, which includes ARKs without a blade. A wrong check character does not change `valid`.
+- `error`: why the ARK is not valid.
+- `warnings`: any of `Blade contains non-betanumeric characters`, `NAAN does not match this resolver`, `Shoulder is not registered in this resolver` and `Check character does not match`.
 
 ```bash
-# Validate a single ARK
 curl -X POST http://localhost:3000/api/v1/validate \
   -H "Content-Type: application/json" \
-  -d '{"arks": ["ark:12345/x6np1wh8kq"]}'
-
-# Validate multiple ARKs
-curl -X POST http://localhost:3000/api/v1/validate \
-  -H "Content-Type: application/json" \
-  -d '{"arks": ["ark:12345/x6np1wh8kq", "ark:12345/b3test123"]}'
-
-# Validate unregistered shoulder ARK (requires has_check_character hint)
-curl -X POST http://localhost:3000/api/v1/validate \
-  -H "Content-Type: application/json" \
-  -d '{"arks": ["ark:12345/z9custom123"], "has_check_character": true}'
+  -d '{"arks": ["ark:12345/x6np1wh8kc"], "has_check_character": true}'
 ```
-
-**Response (Multiple ARKs):**
 
 ```json
 {
   "results": [
     {
-      "ark": "ark:12345/x6np1wh8kq",
+      "ark": "ark:12345/x6np1wh8kc",
       "valid": true,
       "naan": "12345",
       "shoulder": "x6",
-      "blade": "np1wh8kq",
+      "blade": "np1wh8kc",
+      "naan_matches": true,
       "shoulder_registered": true,
       "has_check_character": true,
-      "check_character_valid": true
-    },
-    {
-      "ark": "ark:12345/b3test123",
-      "valid": true,
-      "naan": "12345",
-      "shoulder": "b3",
-      "blade": "test123",
-      "shoulder_registered": true,
-      "has_check_character": false,
       "check_character_valid": true
     }
   ]
 }
 ```
 
-**Response (Invalid ARK):**
+An ARK from another NAAN with a UUID blade, validated without `has_check_character`:
 
 ```json
 {
   "results": [
     {
-      "ark": "ark:12345/x6np1wh8k",
-      "valid": false,
-      "naan": "12345",
-      "shoulder": "x6",
-      "blade": "np1wh8k",
-      "shoulder_registered": true,
-      "has_check_character": true,
-      "check_character_valid": false,
+      "ark": "ark:99999/b1550e8400-e29b-41d4-a716-446655440000",
+      "valid": true,
+      "naan": "99999",
+      "shoulder": "b1",
+      "blade": "550e8400e29b41d4a716446655440000",
+      "naan_matches": false,
+      "shoulder_registered": null,
+      "has_check_character": null,
+      "check_character_valid": null,
       "warnings": [
-        "Check character validation failed. Either there's an error or this ARK has no check character."
+        "Blade contains non-betanumeric characters",
+        "NAAN does not match this resolver"
       ]
     }
   ]
 }
 ```
 
-**Response (Unregistered Shoulder - Strict Mode):**
+An ARK with a character outside the repertoire:
 
 ```json
 {
   "results": [
     {
-      "ark": "ark:12345/z9custom123",
+      "ark": "ark:12345/x6np,1wh8k",
       "valid": false,
       "naan": "12345",
-      "shoulder": "z9",
-      "blade": "custom123",
-      "shoulder_registered": false,
+      "shoulder": "x6",
+      "blade": "np,1wh8k",
+      "naan_matches": true,
+      "shoulder_registered": true,
       "has_check_character": null,
       "check_character_valid": null,
-      "error": "Unknown shoulder. Please specify has_check_character parameter to validate unregistered shoulders."
+      "error": "Name or qualifier contains characters outside the ARK repertoire",
+      "warnings": ["Blade contains non-betanumeric characters"]
     }
   ]
 }
 ```
 
-#### 5. Resolve ARK
+A request without the header `Content-Type: application/json` returns `415 Unsupported Media Type`, a body that is not JSON `400 Bad Request`, and one without `arks` or `shoulder` `422 Unprocessable Entity`, each with a plain-text message.
 
-Resolve an ARK identifier to its target URL. Returns a 302 redirect.
+### Resolve ARKs
+
+Redirects an ARK to the target its shoulder's `route_pattern` builds.
 
 ```
-GET /ark:{naan}/{shoulder}{blade}[/{qualifier}]
+GET /ark:{naan}/{shoulder}{blade}[{qualifier}]
 ```
 
-**Examples:**
+The label may be `ark:` or `ark:/` in any letter case. The service selects the shoulder by the normalized NAAN and shoulder, so `ark:12345/x-6np1wh8kc` resolves like `ark:12345/x6np1wh8kc`. The target receives the ARK as requested, with the label written as `ark:`; the ARK's query string, such as `?info`, becomes the target's query string. The redirect target is serialized as a URL, which percent-encodes characters a URL cannot contain.
 
 ```bash
-# Resolve ARK without qualifier
-curl -L http://localhost:3000/ark:12345/x6np1wh8kq
-
-# Resolve ARK with qualifier
-curl -L http://localhost:3000/ark:12345/x6np1wh8kq/page2.pdf
-
-# Resolve ARK with complex qualifier path
-curl -L http://localhost:3000/ark:12345/x6np1wh8kq/documents/chapter3/figure5.jpg
-
-# Get redirect location without following (use -I for HEAD request)
-curl -I http://localhost:3000/ark:12345/x6np1wh8kq
+curl -I http://localhost:3000/ark:12345/x6np1wh8kc/page2.pdf
 ```
-
-**Response:**
 
 ```
 HTTP/1.1 302 Found
-Location: https://example.org/x6np1wh8kq
+Location: https://alpha.example.org/x6np1wh8kc/page2.pdf
 ```
 
-The `-L` flag in curl will automatically follow the redirect to the target URL.
+Errors, each with a plain-text body:
 
-**Error Responses:**
+- `400 Bad Request`: the path is not an ARK that conforms to the specification, the NAAN is not this resolver's, or the target's path would contain a `.` or `..` segment, encoded or not.
+- `404 Not Found`: the shoulder is not configured, the Name has no primordinal shoulder, or the path does not start with an ARK label.
+- `500 Internal Server Error`: the shoulder's `route_pattern` built no valid URL.
 
-- `404 Not Found`: Shoulder not configured
-- `400 Bad Request`: Invalid ARK format or NAAN mismatch
+## Configuration
 
-### Configuration
+The service reads its configuration from environment variables. An invalid value stops the service at startup with a message naming the variable.
 
-The service is configured via environment variables:
+### NAAN
 
-**NAAN** (optional, default: "12345")
+Required. The NAAN this service mints and resolves; it must be betanumeric and is used in lowercase.
 
 ```bash
 export NAAN="12345"
 ```
 
-**DEFAULT_BLADE_LENGTH** (optional, default: 8)
+### PORT
 
-The default length of the randomly generated blade portion of minted ARKs, **excluding the check character**. This controls how many betanumeric characters are generated. If `uses_check_character` is true, the check character will be appended after these characters, making the total blade length one character longer. Individual shoulders can override this with their own `blade_length` configuration.
+Optional, default 3000. The port the service listens on, on all interfaces.
 
-For example, with `DEFAULT_BLADE_LENGTH=8` and `uses_check_character=true`, the resulting blade will be 9 characters (8 random + 1 check).
+### DEFAULT_BLADE_LENGTH
 
-```bash
-export DEFAULT_BLADE_LENGTH="8"
-```
+Optional, default 8, at least 1. The number of random characters in a minted blade, without the check character, for shoulders without their own `blade_length`. With a check character the blade has one more character: `DEFAULT_BLADE_LENGTH=8` gives 9-character blades.
 
-**MAX_MINT_COUNT** (optional, default: 1000)
+### MAX_MINT_COUNT
 
-The maximum number of ARKs that can be minted in a single request. This limit is enforced for safety to prevent accidental mass generation of identifiers.
+Optional, default 1000, at least 1. The largest number of ARKs one mint request returns.
 
-```bash
-export MAX_MINT_COUNT="1000"
-```
+### Collision risk
 
-**Collision Implications:**
+Random blades of length n come from 29^n possible values. The birthday bound gives the number of minted ARKs at which a collision becomes 1% likely, about √(0.02 × 29^n):
 
-The blade length determines the size of your identifier namespace and affects collision probability when minting random ARKs. With 29 betanumeric characters, the total namespace size is 29^n.
+| Blade length | Possible blades  | 1% collision risk at |
+| ------------ | ---------------- | -------------------- |
+| 6            | ~595 million     | ~3,450 ARKs          |
+| 8            | ~500 billion     | ~100,000 ARKs        |
+| 10           | ~421 trillion    | ~2.9 million ARKs    |
+| 12           | ~354 quadrillion | ~84 million ARKs     |
 
-| Blade Length | Namespace Size   | Safe Minting Qty (≤1% collision risk) | Notes                                     |
-| ------------ | ---------------- | ------------------------------------- | ----------------------------------------- |
-| 6            | ~594 million     | ~3,450 ARKs                           | Small projects only                       |
-| 8            | ~500 billion     | ~100,000 ARKs                         | **Default - suitable for most use cases** |
-| 10           | ~420 trillion    | ~2.9 million ARKs                     | Large institutional collections           |
-| 12           | ~354 quadrillion | ~84 million ARKs                      | Very large scale, minimal collision risk  |
+At 8 characters, 10,000 ARKs carry a collision risk of about 0.01%, 100,000 ARKs about 1%, and 1 million ARKs about 63%. Volumes beyond the 1% point need a longer blade or external collision detection.
 
-**Guidelines for choosing blade length:**
+### SHOULDERS configuration
 
-- **6 characters**: Only for small pilots or testing (thousands of ARKs)
-- **8 characters**: Recommended default for most institutions (up to ~100k ARKs safely)
-- **10 characters**: Large institutions with millions of objects
-- **12+ characters**: Extreme scale operations or when you need virtually no collision risk
-
-**Note on collision probability:**
-
-These estimates use the birthday paradox: collision probability becomes significant (~1%) when you've minted approximately sqrt(0.02 × N) identifiers, where N is the namespace size. The actual risk depends on your minting volume:
-
-- At 8 characters, minting 10,000 ARKs ≈ 0.01% collision risk
-- At 8 characters, minting 100,000 ARKs ≈ 1% collision risk
-- At 8 characters, minting 1 million ARKs ≈ 63% collision risk (not recommended)
-
-**Collision detection:** This service does not currently implement collision detection or maintain a database of minted ARKs. For production use with high minting volumes, consider implementing external collision detection or using sequential identifiers instead of random generation.
-
-**SHOULDERS** (required) - JSON format:
+Required. The shoulders and their redirect targets, as a JSON object:
 
 ```bash
 export SHOULDERS='{
@@ -515,86 +363,52 @@ export SHOULDERS='{
 }'
 ```
 
-**Shoulder Configuration Fields:**
+- `route_pattern` (required): the redirect target (see [Route patterns](#route-patterns)).
+- `project_name` (required): a name for the shoulder's project.
+- `uses_check_character` (optional, default `true`): whether minted ARKs end with a check character.
+- `blade_length` (optional, at least 1): the shoulder's blade length without the check character; `DEFAULT_BLADE_LENGTH` applies without it.
 
-- `route_pattern` (required): URL template for resolving ARKs (see Template Variables section below)
-- `project_name` (required): Human-readable name for the project
-- `uses_check_character` (optional, default: true): Whether to append a check character to minted ARKs
-- `blade_length` (optional): Override the default blade length for this specific shoulder, **excluding the check character**. Allows different shoulders to use different identifier lengths based on their scale needs. If not specified, uses `DEFAULT_BLADE_LENGTH`. The actual minted blade will be one character longer if `uses_check_character` is true.
+Each key must be a primordinal shoulder, such as `x6` or `bcd7`: ARKs minted under any other key could never resolve, so such a key stops the service, as do unknown fields.
 
-**SHOULDERS** - Simple format (tab-delimited):
+`SHOULDERS` also accepts a simple format of comma-separated entries with three tab-separated fields, shoulder, route pattern and project name. A literal `\t` counts as a tab, as Docker Compose YAML passes it. Entries in this format use check characters and `DEFAULT_BLADE_LENGTH`, and their fields cannot contain commas or tabs.
 
 ```bash
-export SHOULDERS="x6\thttps://alpha.example.org/\${value}\tProject Alpha,b3\thttps://beta.example.org/items/\${value}\tProject Beta"
+export SHOULDERS='x6\thttps://alpha.example.org/${value}\tProject Alpha,b3\thttps://beta.example.org/items/${value}\tProject Beta'
 ```
 
-#### Template Variables in Route Patterns
+### Route patterns
 
-The `route_pattern` field supports template variables for flexible URL construction. Both `${var}` and `{var}` syntax are supported and equivalent.
+A `route_pattern` is an `http` or `https` URL. Without template variables, the service appends the ARK to it, so the pattern ends with `/` or `=`. With template variables, each variable carries its part of the ARK as requested, including hyphens and letter case. Each `${var}` may also be written `{var}`. For `ark:12345/x6np1wh8k/page2.pdf`:
 
-**Available variables:**
+- `${pid}`: `ark:12345/x6np1wh8k/page2.pdf`, always with the label `ark:`
+- `${scheme}`: `ark`
+- `${content}`: `12345/x6np1wh8k/page2.pdf`, everything after the label
+- `${prefix}` or `${naan}`: `12345`
+- `${value}`: `x6np1wh8k/page2.pdf`, everything after the NAAN and `/`
 
-- `${pid}` or `{pid}` - Full ARK identifier (e.g., `ark:12345/x6np1wh8k/page2.pdf`)
-- `${scheme}` or `{scheme}` - Scheme (always `ark`)
-- `${content}` or `{content}` - Everything after "ark:" (e.g., `12345/x6np1wh8k/page2.pdf`)
-- `${prefix}` or `{prefix}` or `{naan}` - NAAN (e.g., `12345`)
-- `${value}` or `{value}` - shoulder+blade+qualifier (e.g., `x6np1wh8k/page2.pdf`)
-
-**Examples:**
-
-```bash
-# Both syntaxes are equivalent:
+```
 "route_pattern": "https://example.org/${value}"
-"route_pattern": "https://example.org/{value}"
-
-# You can mix formats:
-"route_pattern": "https://api.org/${prefix}/items/{value}"
-
-# Use as query parameter:
-"route_pattern": "https://resolver.org/resolve?id=${value}"
+"route_pattern": "https://api.example.org/${prefix}/items/${value}"
+"route_pattern": "https://resolver.example.org/resolve?id=${pid}"
 ```
 
-**Note:** If no template variables are present in the route pattern, the full ARK identifier will be appended to the URL (N2T.net standard behavior).
+The variables end before the ARK's query string. That query string joins the target's query, after the pattern's own parameters and an `&`: `https://example.org/${value}?format=json` turns `ark:12345/x6np1wh8k?info` into `https://example.org/x6np1wh8k?format=json&info`. The bare `?` inflection has no parameter to add, so it reaches the target only when the pattern has no query of its own.
 
-### Running the Service
+Variables may appear in the path, query or fragment, never in the scheme, user info, host or port. In the query or fragment, `&`, `=`, `+` and `#` in a variable's value are percent-encoded, so the Name and qualifier cannot add parameters. Every `{` and `}` must belong to a known variable, and the pattern itself must contain no `.` or `..` path segment; anything else stops the service.
+
+## Running the service
 
 ```bash
-# Set configuration
 export NAAN="12345"
-export DEFAULT_BLADE_LENGTH="8"
-export MAX_MINT_COUNT="1000"
-export SHOULDERS='{"x6":{"route_pattern":"https://example.org/${value}","project_name":"Test Project","uses_check_character":true}}'
+export SHOULDERS='{"x6":{"route_pattern":"https://example.org/${value}","project_name":"Test Project"}}'
 
-# Run the service
-cargo run
-
-# Or with release optimizations
 cargo run --release
 ```
 
-The service will start on `http://0.0.0.0:3000`.
+The service listens on `http://0.0.0.0:3000`, or on the port in `PORT`, and stops on SIGTERM or Ctrl-C after finishing open requests.
 
-**Example with custom blade lengths:**
+## Releases
 
-```bash
-# Set default blade length to 12 characters
-export DEFAULT_BLADE_LENGTH="12"
+CI runs formatting, clippy and the tests before it builds an image. Pushes to `main` publish the tags `main` and `sha-<commit>`. A `v*.*.*` tag publishes the version tags, the major-version tag only from 1.0 on; a tag without a prerelease suffix, such as `v0.1.0` but not `v0.1.0-alpha`, also moves `latest`, so `latest` always points at a release.
 
-# Configure shoulders with different blade lengths
-export SHOULDERS='{
-  "x6": {
-    "route_pattern": "https://example.org/${value}",
-    "project_name": "Small Project",
-    "uses_check_character": true,
-    "blade_length": 6
-  },
-  "b3": {
-    "route_pattern": "https://example.org/${value}",
-    "project_name": "Large Project",
-    "uses_check_character": true
-  }
-}'
-
-# x6 will mint 6-character ARKs, b3 will use the default (12 characters)
-cargo run
-```
+The image checks its own health with `curl` against `/ark:${NAAN}/servicestatus`.

@@ -1,57 +1,40 @@
-# Build stage
-FROM rust:1.90-slim AS builder
+# The builder's Debian release must match the runtime image, or the binary needs a newer glibc
+FROM rust:1.90-slim-bookworm AS builder
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && \
-    apt-get install -y pkg-config libssl-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-# Copy manifests
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy main.rs to cache dependencies
+# Builds the dependencies in their own layer, so source changes don't rebuild them
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
-    cargo build --release && \
+    cargo build --release --locked && \
     rm -rf src
 
-# Copy source code
 COPY src ./src
 
-# Build the actual application
-# Touch main.rs to ensure it's rebuilt
+# The source must look newer than the dummy main.rs for cargo to rebuild it
 RUN touch src/main.rs && \
-    cargo build --release
+    cargo build --release --locked
 
-# Runtime stage
 FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
 RUN apt-get update && \
     apt-get install -y ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy the binary from builder
 COPY --from=builder /app/target/release/ark-service /usr/local/bin/ark-service
 
-# Create a non-root user
 RUN useradd -m -u 1000 arkuser && \
     chown -R arkuser:arkuser /app
 
 USER arkuser
 
-# Expose the port
 EXPOSE 3000
 
-# Set default environment variables
-ENV NAAN="12345" \
-    DEFAULT_BLADE_LENGTH="8" \
-    MAX_MINT_COUNT="1000" \
-    RUST_LOG="info"
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS "http://localhost:${PORT:-3000}/ark:$(printf %s "$NAAN" | tr '[:upper:]' '[:lower:]')/servicestatus" || exit 1
 
-# Run the application
 CMD ["/usr/local/bin/ark-service"]

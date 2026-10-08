@@ -1,6 +1,14 @@
+use std::process::ExitCode;
+
 use ark_service::server;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    server::run().await
+async fn main() -> ExitCode {
+    match server::run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "Service stopped");
+            ExitCode::FAILURE
+        }
+    }
 }

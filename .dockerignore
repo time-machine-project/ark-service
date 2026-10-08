@@ -24,7 +24,6 @@ target/
 # Docker
 Dockerfile
 .dockerignore
-docker-compose.yml
 
 # Environment files
 .env
@@ -40,8 +39,8 @@ Thumbs.db
 
 # Project specific
 .claude/
-.fuchs.override.yml
-.fuchs-project
-.wakatime-project
+.direnv/
+.envrc
 .markdownlint.yml
 justfile
+temp/

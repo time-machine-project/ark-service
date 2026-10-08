@@ -1,178 +1,111 @@
-use crate::ark::parse_ark;
-use crate::check_character::validate_check_character;
-use crate::config::{AppState, BETANUMERIC};
+use std::fmt;
 
-/// Result of ARK validation
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Serialize, Serializer};
+
+use crate::ark::{is_betanumeric, parse_ark};
+use crate::check_character::validate_check_character;
+use crate::config::AppState;
+
+pub const MAX_ARKS_PER_REQUEST: usize = 1000;
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct ValidationResult {
     pub valid: bool,
     pub naan: Option<String>,
     pub shoulder: Option<String>,
     pub blade: Option<String>,
+    pub naan_matches: Option<bool>,
     pub shoulder_registered: Option<bool>,
     pub has_check_character: Option<bool>,
     pub check_character_valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    pub warnings: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Warning>,
 }
 
-impl ValidationResult {
-    /// Creates a validation result for a parsing error
-    pub fn parse_error() -> Self {
-        Self {
-            valid: false,
-            naan: None,
-            shoulder: None,
-            blade: None,
-            shoulder_registered: None,
-            has_check_character: None,
-            check_character_valid: None,
-            error: Some("Failed to parse ARK structure".to_string()),
-            warnings: None,
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warning {
+    BladeNotBetanumeric,
+    NaanMismatch,
+    ShoulderNotRegistered,
+    CheckCharacterMismatch,
+}
+
+impl fmt::Display for Warning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Warning::BladeNotBetanumeric => "Blade contains non-betanumeric characters",
+            Warning::NaanMismatch => "NAAN does not match this resolver",
+            Warning::ShoulderNotRegistered => "Shoulder is not registered in this resolver",
+            Warning::CheckCharacterMismatch => "Check character does not match",
+        })
     }
 }
 
-/// Validates an ARK identifier
+impl Serialize for Warning {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Validates an ARK against draft-kunze-ark-43
+///
+/// `valid` reflects only the spec. Whether this resolver would redirect the ARK is reported in
+/// `naan_matches` and `shoulder_registered`, and the check character is tested only when the
+/// caller says the ARK has one.
 pub fn validate_ark(
     state: &AppState,
     ark: &str,
     has_check_character: Option<bool>,
 ) -> ValidationResult {
-    // Parse ARK
-    let Some(parsed) = parse_ark(ark) else {
-        tracing::debug!(
-            ark = %ark,
-            "Validation failed: invalid ARK format"
-        );
-        return ValidationResult::parse_error();
+    let parsed = match parse_ark(ark) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return ValidationResult {
+                has_check_character,
+                error: Some(e.to_string()),
+                ..Default::default()
+            };
+        }
     };
 
-    // Validate betanumeric characters in shoulder and blade
-    if !is_betanumeric(&parsed.shoulder) || !is_betanumeric(&parsed.blade) {
-        tracing::debug!(
-            ark = %ark,
-            shoulder = %parsed.shoulder,
-            blade = %parsed.blade,
-            "Validation failed: non-betanumeric characters"
-        );
-        return ValidationResult {
-            valid: false,
-            naan: Some(parsed.naan),
-            shoulder: Some(parsed.shoulder),
-            blade: Some(parsed.blade),
-            shoulder_registered: None,
-            has_check_character: None,
-            check_character_valid: None,
-            error: Some(
-                "Shoulder and blade must contain only betanumeric characters (0-9, b-z excluding vowels)".to_string()
-            ),
-            warnings: None,
-        };
+    let mut warnings = Vec::new();
+    if !is_betanumeric(parsed.blade()) {
+        warnings.push(Warning::BladeNotBetanumeric);
     }
 
-    // Check if NAAN matches
-    let naan_matches = parsed.naan == state.naan;
-    let naan_error = if !naan_matches {
-        Some(format!(
-            "NAAN {} does not match configured NAAN {}",
-            parsed.naan, state.naan
-        ))
-    } else {
-        None
-    };
+    let naan_matches = parsed.naan() == state.naan;
+    let shoulder_registered = naan_matches.then(|| {
+        parsed
+            .shoulder()
+            .is_some_and(|s| state.shoulders.contains_key(s))
+    });
+    if !naan_matches {
+        warnings.push(Warning::NaanMismatch);
+    } else if shoulder_registered == Some(false) {
+        warnings.push(Warning::ShoulderNotRegistered);
+    }
 
-    // Check if shoulder is registered
-    let shoulder_config = state.shoulders.get(&parsed.shoulder);
-    let shoulder_registered = shoulder_config.is_some();
+    let check_character_valid = (has_check_character == Some(true) && !parsed.blade().is_empty())
+        .then(|| validate_check_character(&parsed.check_zone()));
+    if check_character_valid == Some(false) {
+        warnings.push(Warning::CheckCharacterMismatch);
+    }
 
-    // Determine if check character should be validated
-    let should_validate_check = match has_check_character {
-        Some(has_check) => Some(has_check),
-        None => {
-            // Check shoulder configuration
-            shoulder_config.map(|c| c.uses_check_character)
-        }
-    };
-
-    // Strict mode: if shoulder is not registered and no hint provided, return error
-    let Some(should_validate_check) = should_validate_check else {
-        tracing::debug!(
-            ark = %ark,
-            shoulder = %parsed.shoulder,
-            "Validation failed: unknown shoulder and no check character hint provided"
-        );
-        return ValidationResult {
-            valid: false,
-            naan: Some(parsed.naan),
-            shoulder: Some(parsed.shoulder),
-            blade: Some(parsed.blade),
-            shoulder_registered: Some(false),
-            has_check_character: None,
-            check_character_valid: None,
-            error: Some(
-                "Unknown shoulder. Please specify has_check_character parameter to validate unregistered shoulders.".to_string()
-            ),
-            warnings: None,
-        };
-    };
-
-    // Check character validation requires blade length > 1 because:
-    // - At least 1 character is needed for the base identifier
-    // - The last character is the check character to validate
-    // Example: blade "ab" -> base "a" + check char "b"
-    let (check_character_valid, warnings) = if should_validate_check && parsed.blade.len() > 1 {
-        let identifier_for_check = format!("{}{}", parsed.shoulder, parsed.blade);
-        let is_valid = validate_check_character(&identifier_for_check);
-
-        let mut warnings_list = Vec::new();
-        if !is_valid {
-            warnings_list.push(
-                "Check character validation failed. Either there's an error or this ARK has no check character."
-                    .to_string(),
-            );
-        }
-        if !shoulder_registered {
-            warnings_list.push("Shoulder is not registered in the system.".to_string());
-        }
-
-        (
-            Some(is_valid),
-            if warnings_list.is_empty() {
-                None
-            } else {
-                Some(warnings_list)
-            },
-        )
-    } else if !should_validate_check {
-        (Some(true), None)
-    } else {
-        (
-            None,
-            Some(vec![
-                "Blade too short for check character validation".to_string(),
-            ]),
-        )
-    };
-
-    let valid = naan_matches && check_character_valid.unwrap_or(true) && shoulder_registered;
-
+    let violation = parsed.violation();
     ValidationResult {
-        valid,
-        naan: Some(parsed.naan),
-        shoulder: Some(parsed.shoulder),
-        blade: Some(parsed.blade),
-        shoulder_registered: Some(shoulder_registered),
-        has_check_character: Some(should_validate_check),
+        valid: violation.is_none(),
+        naan: Some(parsed.naan().to_string()),
+        shoulder: parsed.shoulder().map(str::to_string),
+        blade: Some(parsed.blade().to_string()),
+        naan_matches: Some(naan_matches),
+        shoulder_registered,
+        has_check_character,
         check_character_valid,
-        error: naan_error,
+        error: violation.map(|v| v.to_string()),
         warnings,
     }
-}
-
-/// Checks if a string contains only valid betanumeric characters
-fn is_betanumeric(s: &str) -> bool {
-    s.bytes().all(|b| BETANUMERIC.contains(&b))
 }
 
 #[cfg(test)]
@@ -182,161 +115,131 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_state() -> AppState {
-        let mut shoulders = HashMap::new();
-        shoulders.insert(
-            "x6".to_string(),
-            Shoulder {
-                route_pattern: "https://example.org/${value}".to_string(),
-                project_name: "Test Project".to_string(),
-                ..Default::default()
-            },
-        );
-        shoulders.insert(
-            "b3".to_string(),
-            Shoulder {
-                route_pattern: "https://beta.org/items/${value}".to_string(),
-                project_name: "Beta Project".to_string(),
-                uses_check_character: false,
-                ..Default::default()
-            },
-        );
-
         AppState {
             naan: "12345".to_string(),
             default_blade_length: 8,
             max_mint_count: 1000,
-            shoulders,
+            shoulders: HashMap::from([("x6".to_string(), Shoulder::default())]),
         }
     }
 
     #[test]
-    fn test_validate_valid_ark_with_check_char() {
-        let state = create_test_state();
-        // Valid ARK with check character: ark:/12345/x6np1wh8f
-        let result = validate_ark(&state, "ark:/12345/x6np1wh8f", Some(true));
+    fn reports_registered_ark_without_warnings() {
+        let result = validate_ark(&create_test_state(), "ark:12345/x6np1wh8k", None);
 
         assert!(result.valid);
-        assert_eq!(result.naan, Some("12345".to_string()));
-        assert_eq!(result.shoulder, Some("x6".to_string()));
-        assert_eq!(result.blade, Some("np1wh8f".to_string()));
+        assert_eq!(result.naan_matches, Some(true));
         assert_eq!(result.shoulder_registered, Some(true));
-        assert_eq!(result.check_character_valid, Some(true));
-        assert!(result.error.is_none());
+        assert_eq!(result.check_character_valid, None);
+        assert!(result.warnings.is_empty());
     }
 
     #[test]
-    fn test_validate_invalid_check_char() {
-        let state = create_test_state();
-        // Invalid check character
-        let result = validate_ark(&state, "ark:/12345/x6np1wh8x", Some(true)); // Wrong check char
+    fn foreign_naan_is_valid_with_a_warning() {
+        let result = validate_ark(&create_test_state(), "ark:99999/x6np1wh8k", None);
 
-        assert!(!result.valid);
-        assert_eq!(result.check_character_valid, Some(false));
-        assert!(result.warnings.is_some());
+        assert!(result.valid);
+        assert_eq!(result.naan_matches, Some(false));
+        assert_eq!(result.shoulder_registered, None);
+        assert_eq!(result.warnings, [Warning::NaanMismatch]);
     }
 
     #[test]
-    fn test_validate_wrong_naan() {
-        let state = create_test_state();
-        let result = validate_ark(&state, "ark:/99999/x6nmkd123", None);
+    fn unregistered_shoulder_is_valid_with_a_warning() {
+        let result = validate_ark(&create_test_state(), "ark:12345/z9np1wh8k", None);
 
-        assert!(!result.valid);
-        assert_eq!(result.naan, Some("99999".to_string()));
-        assert_eq!(result.shoulder, Some("x6".to_string()));
-        assert_eq!(result.blade, Some("nmkd123".to_string()));
-        assert_eq!(result.shoulder_registered, Some(true)); // x6 is registered
-        assert!(result.has_check_character.is_some());
-        assert!(result.check_character_valid.is_some());
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("does not match"));
+        assert!(result.valid);
+        assert_eq!(result.naan_matches, Some(true));
+        assert_eq!(result.shoulder_registered, Some(false));
+        assert_eq!(result.warnings, [Warning::ShoulderNotRegistered]);
     }
 
     #[test]
-    fn test_validate_unregistered_shoulder() {
-        let state = create_test_state();
-        let result = validate_ark(&state, "ark:/12345/z9nmkd123", Some(false));
+    fn name_without_primordinal_shoulder_is_not_registered() {
+        let result = validate_ark(&create_test_state(), "ark:12345/bcd", None);
 
-        assert!(!result.valid);
+        assert!(result.valid);
+        assert_eq!(result.shoulder, None);
+        assert_eq!(result.blade.as_deref(), Some("bcd"));
         assert_eq!(result.shoulder_registered, Some(false));
     }
 
     #[test]
-    fn test_validate_invalid_ark_format() {
-        let state = create_test_state();
-        let result = validate_ark(&state, "not-an-ark", None);
-
-        assert!(!result.valid);
-        assert!(result.error.is_some());
-        assert_eq!(result.error.unwrap(), "Failed to parse ARK structure");
-    }
-
-    #[test]
-    fn test_validate_no_check_char_shoulder() {
-        let state = create_test_state();
-        // b3 shoulder doesn't use check characters
-        let result = validate_ark(&state, "ark:/12345/b3nmkd123", None); // Will use shoulder config
+    fn non_betanumeric_blade_is_valid_with_a_warning() {
+        let result = validate_ark(
+            &create_test_state(),
+            "ark:12345/x6550e8400-e29b-41d4-a716-446655440000",
+            None,
+        );
 
         assert!(result.valid);
-        assert_eq!(result.has_check_character, Some(false));
-        assert_eq!(result.check_character_valid, Some(true)); // Skipped validation
+        assert_eq!(
+            result.blade.as_deref(),
+            Some("550e8400e29b41d4a716446655440000")
+        );
+        assert_eq!(result.warnings, [Warning::BladeNotBetanumeric]);
     }
 
     #[test]
-    fn test_validate_blade_too_short() {
+    fn checks_the_check_character_only_on_request() {
         let state = create_test_state();
-        let result = validate_ark(&state, "ark:/12345/x6b", Some(true)); // Blade is only "b"
+        let correct = crate::minting::mint_ark("12345", "x6", 8, true);
+        let mut wrong = correct.clone();
+        let last = wrong.pop().unwrap();
+        wrong.push(if last == '0' { '1' } else { '0' });
 
-        // Blade too short for check character validation, but shoulder is registered
-        // so it should be valid with a warning
-        assert!(result.valid);
-        assert_eq!(result.shoulder_registered, Some(true));
-        assert_eq!(result.check_character_valid, None); // No validation performed
-        assert!(result.warnings.is_some());
-        let warnings = result.warnings.unwrap();
-        assert!(warnings.iter().any(|w| w.contains("too short")));
+        for has_check_character in [None, Some(false)] {
+            let unchecked = validate_ark(&state, &wrong, has_check_character);
+            assert_eq!(unchecked.has_check_character, has_check_character);
+            assert_eq!(unchecked.check_character_valid, None);
+        }
+
+        let checked = validate_ark(&state, &correct, Some(true));
+        assert_eq!(checked.check_character_valid, Some(true));
+
+        let failed = validate_ark(&state, &wrong, Some(true));
+        assert!(failed.valid);
+        assert_eq!(failed.check_character_valid, Some(false));
+        assert_eq!(failed.warnings, [Warning::CheckCharacterMismatch]);
     }
 
     #[test]
-    fn test_validate_invalid_shoulder_characters() {
-        let state = create_test_state();
-        // Shoulder with vowel 'a'
-        let result = validate_ark(&state, "ark:/12345/a6nmkd123", None);
+    fn checks_the_check_character_of_an_ark_with_qualifier_and_hyphens() {
+        let ark = crate::minting::mint_ark("12345", "x6", 8, true);
+        let (prefix, blade) = ark.split_at("ark:12345/x6".len());
+        let hyphenated = format!("{prefix}{}-{}/page2.pdf", &blade[..4], &blade[4..]);
+
+        let result = validate_ark(&create_test_state(), &hyphenated, Some(true));
+        assert_eq!(result.check_character_valid, Some(true));
+    }
+
+    #[test]
+    fn tests_no_check_character_without_a_blade() {
+        let result = validate_ark(&create_test_state(), "ark:12345/x6", Some(true));
+
+        assert_eq!(result.blade.as_deref(), Some(""));
+        assert_eq!(result.check_character_valid, None);
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn reports_why_a_string_is_not_an_ark() {
+        let result = validate_ark(&create_test_state(), "not-an-ark", None);
 
         assert!(!result.valid);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("betanumeric"));
+        assert_eq!(result.error.as_deref(), Some("Missing \"ark:\" label"));
+        assert_eq!(result.naan_matches, None);
     }
 
     #[test]
-    fn test_validate_invalid_blade_characters() {
-        let state = create_test_state();
-        // Blade with uppercase letter
-        let result = validate_ark(&state, "ark:/12345/x6Nmkd123", None);
+    fn reports_spec_violations() {
+        let result = validate_ark(&create_test_state(), "ark:12345/x6np,1wh8k", None);
 
         assert!(!result.valid);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("betanumeric"));
-    }
-
-    #[test]
-    fn test_validate_invalid_blade_with_vowel() {
-        let state = create_test_state();
-        // Blade with vowel 'e'
-        let result = validate_ark(&state, "ark:/12345/x6nmked123", None);
-
-        assert!(!result.valid);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("betanumeric"));
-    }
-
-    #[test]
-    fn test_validate_invalid_blade_with_special_char() {
-        let state = create_test_state();
-        // Blade with special character '@'
-        let result = validate_ark(&state, "ark:/12345/x6nmkd@123", None);
-
-        assert!(!result.valid);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("betanumeric"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Name or qualifier contains characters outside the ARK repertoire")
+        );
+        assert_eq!(result.naan_matches, Some(true));
     }
 }
